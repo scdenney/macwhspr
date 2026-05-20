@@ -1,9 +1,11 @@
 # macwhspr context for Claude
 
-This folder is the macOS counterpart to `o_system/hyperwhspr/`. It documents a
-voice-to-text setup that triggers on the Globe/Fn key and feeds OpenAI
-`gpt-4o-transcribe` → `gpt-4.1-mini` cleanup. Same prompt, same vocab format,
-same `/hypr-calibrate` loop as the Linux setup — only the system glue differs.
+This folder is the macOS counterpart to
+[`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr) (Linux). It
+documents a voice-to-text setup that triggers on the Globe/Fn key and feeds
+OpenAI `gpt-4o-transcribe` → `gpt-4.1-mini` cleanup. Same prompt, same vocab
+format, same `/hypr-calibrate` loop as the Linux setup — only the system glue
+differs.
 
 ## What lives here
 
@@ -57,7 +59,7 @@ anything new.
 
 Run these in parallel:
 
-- `uname -s` — must print `Darwin`. If it prints `Linux`, stop and tell the user they're on Linux, point them at `o_system/hyperwhspr/`.
+- `uname -s` — must print `Darwin`. If it prints `Linux`, stop and tell the user they're on Linux, point them at [`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr).
 - `pwd` — must end in `o_macos/macwhspr`
 - `command -v brew` — Homebrew must be installed
 - `command -v python3`

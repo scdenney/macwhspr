@@ -1,11 +1,13 @@
 # macwhspr — Mac voice-to-text setup
 
-This folder is the macOS counterpart to
-[`o_system/hyperwhspr`](../../o_system/hyperwhspr/). It is not an application
-or package. It is a reproducible configuration pattern: Globe-key triggered
-voice recording, OpenAI transcription, post-transcription LLM cleanup, and a
-calibration loop for vocabulary, style, and written prosody — the same pipeline
-as the Linux setup, with the system glue swapped for Mac-native pieces.
+This is the macOS counterpart to
+[`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr) (the Linux
+setup). It is not an application or package — it is a reproducible
+configuration pattern: Globe-key triggered voice recording, OpenAI
+transcription, post-transcription LLM cleanup, and a calibration loop for
+vocabulary, style, and written prosody. Same pipeline as the Linux setup,
+system glue swapped for Mac-native pieces (Karabiner-Elements, Hammerspoon,
+launchd, sox).
 
 ## Pipeline
 
@@ -279,7 +281,7 @@ OpenAI. Not wired up here; flagged as a known follow-up.
 
 ## Relationship to the Linux setup
 
-| Piece | Linux (`hyperwhspr/`) | Mac (`macwhspr/`) |
+| Piece | Linux ([`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr)) | Mac (this repo) |
 | --- | --- | --- |
 | Voice daemon | `hyprwhspr` (upstream binary) | `daemon.py` in this repo |
 | Service manager | systemd user service | launchd LaunchAgent |
