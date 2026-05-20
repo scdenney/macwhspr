@@ -1,0 +1,17 @@
+# Local secrets
+credentials
+*.env
+
+# macwhspr local runtime output
+cleanup_log.jsonl
+daemon.pid
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store

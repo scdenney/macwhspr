@@ -1,0 +1,36 @@
+{
+  "title": "macwhspr: Fn/Globe tap → F18",
+  "rules": [
+    {
+      "description": "Tap the Globe/Fn key alone to send F18 (held: still acts as Fn for Fn+F1 brightness, etc.). F18 is bound by Hammerspoon to toggle the macwhspr recording daemon.",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "apple_vendor_top_case_key_code": "keyboard_fn",
+            "modifiers": {
+              "optional": ["any"]
+            }
+          },
+          "to": [
+            {
+              "apple_vendor_top_case_key_code": "keyboard_fn"
+            }
+          ],
+          "to_if_alone": [
+            {
+              "key_code": "f18"
+            }
+          ],
+          "conditions": [
+            {
+              "type": "variable_unless",
+              "name": "macwhspr_disabled",
+              "value": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
+  "transcription_model": "gpt-4o-transcribe",
+  "whisper_prompt": "Transcribe accurately. The speaker is an assistant professor in programming research and computer science.",
+  "language": null,
+  "post_transcription_hook": "/Users/YOUR_USER/.config/macwhspr/cleanup.py",
+  "paste_after_copy": true,
+  "audio_feedback": true,
+  "sample_rate": 16000,
+  "rest_timeout": 60
+}

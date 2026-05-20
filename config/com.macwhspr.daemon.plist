@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.macwhspr.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USER/.local/share/macwhspr/venv/bin/python</string>
+        <string>/Users/YOUR_USER/.config/macwhspr/daemon.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/macwhspr.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/Library/Logs/macwhspr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>MACWHSPR_CLEANUP_MODEL</key>
+        <string>gpt-4.1-mini</string>
+        <key>MACWHSPR_LLM_API_URL</key>
+        <string>https://api.openai.com/v1/chat/completions</string>
+    </dict>
+</dict>
+</plist>
