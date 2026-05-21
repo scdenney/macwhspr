@@ -148,6 +148,10 @@ the Python interpreter inside the venv. Allow it.
   hear a `Pop`, the pill switches to a blue **Transcribing** spinner, then a
   brief green **Done** check before fading. If anything fails, you'll hear
   `Funk`, the pill flashes a red **Error**, and the error will be in the log.
+- **Ctrl-Cmd-V** — open a chooser of the last ~20 transcripts (read from
+  `cleanup_log.jsonl`). Pick one to paste it into the focused field; Esc to
+  cancel. Useful when the original paste landed in the wrong window, or when
+  you want to reach back further than the system clipboard remembers.
 
 To turn the overlay off (audio cues only), set `"overlay": false` in
 `~/.config/macwhspr/config.json` and restart the daemon
@@ -271,13 +275,7 @@ OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-05-20 | Initial Mac port | — |
 | 2026-05-20 | Added `hs.canvas` recording overlay; daemon drives state via `hs -c` IPC | Bootstrap now `require("hs.ipc")`; module split into `~/.hammerspoon/macwhspr.lua` |
 | 2026-05-20 | Latency tuning pass 1: cleanup ran as a subprocess and each API call opened a fresh TCP+TLS connection | Persistent `httpx.Client(http2=True)`, inline cleanup, skip-cleanup heuristic for short well-formed transcripts. Details in `PERFORMANCE.md` |
-
-## Security notes
-
-- Do not commit `~/.local/share/macwhspr/credentials`.
-- Do not commit `~/.config/macwhspr/cleanup_log.jsonl`; it contains dictated text.
-- Review `vocab.md` before publishing if it includes personal names, project
-  names, or sensitive vocabulary.
+| 2026-05-21 | No way to re-paste a previous transcript when the original paste landed in the wrong window | Added `Ctrl-Cmd-V` chooser in `hammerspoon_macwhspr.lua` over the last 20 entries in `cleanup_log.jsonl` |
 
 ## Relationship to the Linux setup
 

@@ -2,6 +2,8 @@
 --
 -- Provides:
 --   * F18 hotkey -> SIGUSR1 to the running macwhspr daemon
+--   * Ctrl-Cmd-V hotkey -> chooser of recent transcripts (re-paste any of the
+--     last ~20 from cleanup_log.jsonl into the focused field)
 --   * macwhspr.show(state) -> floating pill overlay for recording feedback
 --
 -- States accepted by show():
@@ -35,6 +37,73 @@ local function toggleRecording()
 end
 
 hs.hotkey.bind({}, "F18", toggleRecording)
+
+-- ---------- History chooser (Ctrl-Cmd-V) ----------
+-- Reads the last N entries from cleanup_log.jsonl. Picking one copies it to
+-- the clipboard and sends Cmd-V into whatever window had focus before the
+-- chooser opened. Skipped-cleanup entries appear too (their `cleaned` field
+-- equals the raw transcript).
+local logFile = os.getenv("HOME") .. "/.config/macwhspr/cleanup_log.jsonl"
+local HISTORY_LIMIT = 20
+
+local function summarize(text)
+    if not text or text == "" then return "(empty)" end
+    local first = text:match("^([^\n]*)") or text
+    if #first > 100 then first = first:sub(1, 97) .. "..." end
+    return first
+end
+
+local function prettyTs(ts)
+    if not ts then return "" end
+    local date, time = ts:match("^(%d%d%d%d%-%d%d%-%d%d)T(%d%d:%d%d)")
+    if date and time then return date .. " " .. time .. " UTC" end
+    return ts
+end
+
+local function loadRecent()
+    local out = hs.execute(string.format(
+        "/usr/bin/tail -n %d %q 2>/dev/null", HISTORY_LIMIT, logFile))
+    if not out or out == "" then return {} end
+    local entries = {}
+    for line in out:gmatch("[^\r\n]+") do
+        local ok, parsed = pcall(hs.json.decode, line)
+        if ok and type(parsed) == "table" and parsed.cleaned then
+            table.insert(entries, parsed)
+        end
+    end
+    return entries
+end
+
+local function showHistory()
+    local entries = loadRecent()
+    if #entries == 0 then
+        hs.alert.show("macwhspr: no history yet")
+        return
+    end
+    local choices = {}
+    for i = #entries, 1, -1 do
+        local e = entries[i]
+        table.insert(choices, {
+            text = summarize(e.cleaned),
+            subText = prettyTs(e.ts),
+            cleaned = e.cleaned,
+        })
+    end
+    local chooser = hs.chooser.new(function(choice)
+        if not choice then return end
+        hs.pasteboard.setContents(choice.cleaned)
+        -- Small delay so focus has time to return to the previous app before
+        -- we synthesize Cmd-V. Same pattern as daemon.py's osascript fallback.
+        hs.timer.doAfter(0.05, function()
+            hs.eventtap.keyStroke({"cmd"}, "v", 10000)
+        end)
+    end)
+    chooser:choices(choices)
+    chooser:searchSubText(true)
+    chooser:show()
+end
+
+hs.hotkey.bind({"ctrl", "cmd"}, "v", showHistory)
 
 -- ---------- Overlay (hs.canvas pill) ----------
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }

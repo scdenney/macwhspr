@@ -19,7 +19,7 @@ differs.
 - `config/com.macwhspr.daemon.plist` - reusable launchd LaunchAgent
 - `config/karabiner.json` - Fn/Globe tap → F18 complex modification
 - `config/hammerspoon.lua` - bootstrap snippet for `~/.hammerspoon/init.lua` (BEGIN/END markers; setup.sh refreshes it idempotently)
-- `config/hammerspoon_macwhspr.lua` - the real module; installed to `~/.hammerspoon/macwhspr.lua`. F18 hotkey + `macwhspr.show(state)` overlay
+- `config/hammerspoon_macwhspr.lua` - the real module; installed to `~/.hammerspoon/macwhspr.lua`. F18 hotkey, Ctrl-Cmd-V history chooser, and `macwhspr.show(state)` overlay
 - `claude/commands/hypr-calibrate.md` - calibration command (paths point at `~/.config/macwhspr/`)
 
 ## Key facts
@@ -29,6 +29,7 @@ differs.
 - Launch agent installed at `~/Library/LaunchAgents/com.macwhspr.daemon.plist`
 - Karabiner asset installed at `~/.config/karabiner/assets/complex_modifications/macwhspr.json`
 - Hotkey path: Globe tap → Karabiner emits F18 → Hammerspoon catches F18 → `kill -USR1 <daemon-pid>`
+- History chooser path: Ctrl-Cmd-V → Hammerspoon `tail -n 20 cleanup_log.jsonl` → `hs.chooser` → on selection, `hs.pasteboard.setContents` + Cmd-V via `hs.eventtap.keyStroke` (50 ms delay so focus returns to the prior app first)
 - Overlay path: daemon shells out to `/opt/homebrew/bin/hs -c "macwhspr.show('state')"` (requires `require("hs.ipc")` in init.lua, which the bootstrap snippet provides)
 - Overlay states: `recording`, `transcribing`, `done`, `error`, `hide`. Rendered by `hs.canvas` in `~/.hammerspoon/macwhspr.lua`
 - Latency path: persistent `httpx.Client(http2=True)` reused across transcribe + cleanup calls; cleanup runs inline (no subprocess). See PERFORMANCE.md for baselines and the optimization log.
