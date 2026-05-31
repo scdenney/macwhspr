@@ -276,6 +276,7 @@ OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-05-20 | Added `hs.canvas` recording overlay; daemon drives state via `hs -c` IPC | Bootstrap now `require("hs.ipc")`; module split into `~/.hammerspoon/macwhspr.lua` |
 | 2026-05-20 | Latency tuning pass 1: cleanup ran as a subprocess and each API call opened a fresh TCP+TLS connection | Persistent `httpx.Client(http2=True)`, inline cleanup, skip-cleanup heuristic for short well-formed transcripts. Details in `PERFORMANCE.md` |
 | 2026-05-21 | No way to re-paste a previous transcript when the original paste landed in the wrong window | Added `Ctrl-Cmd-V` chooser in `hammerspoon_macwhspr.lua` over the last 20 entries in `cleanup_log.jsonl` |
+| 2026-05-31 | Toggling recording on without saying anything pasted the prompt text back (`gpt-4o-transcribe` hallucinates the `whisper_prompt` on silence) | Daemon drops silent clips (RMS below `silence_rms_threshold`, default `0.01`) before transcribing, and discards any transcript that is empty or just echoes the prompt or one of its sentences. Tune via `silence_rms_threshold` in `config.json`; the measured RMS is logged each recording |
 
 ## Relationship to the Linux setup
 

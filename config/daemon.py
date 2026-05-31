@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "audio_feedback": True,
     "overlay": True,
     "skip_short_cleanup": True,
+    "silence_rms_threshold": 0.01,
     "sample_rate": 16000,
     "rest_timeout": 60,
 }
@@ -182,6 +183,77 @@ def should_skip_cleanup(raw: str) -> bool:
     return True
 
 
+def measure_rms(path: Path) -> "float | None":
+    """Return the recording's RMS amplitude (0..1) via `sox ... stat`, or None.
+
+    Fail-soft: any sox/parse error returns None so callers treat the level as
+    unknown and transcribe anyway rather than dropping audio on a glitch.
+    """
+    try:
+        result = subprocess.run(
+            ["sox", str(path), "-n", "stat"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log(f"RMS measure skipped: {exc}")
+        return None
+    for line in result.stderr.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("RMS") and "amplitude" in stripped:
+            try:
+                return float(stripped.split()[-1])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def recording_is_silent(path: Path) -> bool:
+    """True if the recording carries no speech-level energy.
+
+    Toggling recording on and saying nothing still yields a multi-second WAV
+    that clears the size guard. Fed near-silence, gpt-4o-transcribe tends to
+    hallucinate -- usually by parroting the whisper prompt back -- so we drop
+    the clip before spending the transcription call. The threshold is
+    configurable (silence_rms_threshold); set it to 0 to disable. The measured
+    level is logged so it can be tuned against real recordings.
+    """
+    threshold = config.get("silence_rms_threshold", 0.01)
+    if not threshold or threshold <= 0:
+        return False
+    rms = measure_rms(path)
+    if rms is None:
+        return False  # couldn't measure -> don't block transcription
+    log(f"audio RMS {rms:.5f} (silence threshold {threshold})")
+    return rms < threshold
+
+
+def _normalize_for_match(text: str) -> str:
+    """Lowercase, collapse runs of non-alphanumerics to single spaces, strip."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def is_prompt_echo(raw: str) -> bool:
+    """True if the transcript is empty or just echoes the whisper prompt.
+
+    On near-silent audio gpt-4o-transcribe sometimes returns the prompt it was
+    handed instead of empty text. Observed forms (see cleanup_log.jsonl
+    history) are the full prompt and either of its sentences alone. We drop the
+    transcript when, normalized, it is empty or exactly equals the whole prompt
+    or any one of its sentences. Exact-match only, so genuine dictation -- even
+    sentences that reuse prompt vocabulary -- is never affected.
+    """
+    n_raw = _normalize_for_match(raw)
+    if not n_raw:
+        return True
+    prompt = (config.get("whisper_prompt") or "").strip()
+    if not prompt:
+        return False
+    candidates = {_normalize_for_match(prompt)}
+    candidates.update(_normalize_for_match(s) for s in re.split(r"[.!?]+", prompt))
+    candidates.discard("")
+    return n_raw in candidates
+
+
 def notify_overlay(state_name: str) -> None:
     if not config.get("overlay", True) or not HS_CLI.exists():
         return
@@ -247,6 +319,12 @@ def stop_and_process() -> None:
         state = "idle"
         return
 
+    if recording_is_silent(RECORDING_FILE):
+        log("No speech detected (silent recording), skipping")
+        notify_overlay("hide")
+        state = "idle"
+        return
+
     rec_duration = t_rec_end - recording_started_at
     audio_kb = RECORDING_FILE.stat().st_size / 1024.0
 
@@ -254,6 +332,10 @@ def stop_and_process() -> None:
         t0 = time.perf_counter()
         raw = transcribe()
         t1 = time.perf_counter()
+        if not raw or is_prompt_echo(raw):
+            log(f"No speech detected (empty or prompt echo): {raw[:80]!r}")
+            notify_overlay("hide")
+            return
         log(f"Raw: {raw[:120]}")
         cleaned = run_cleanup(raw)
         t2 = time.perf_counter()

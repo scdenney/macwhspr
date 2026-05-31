@@ -30,6 +30,29 @@ tail -f ~/Library/Logs/macwhspr.log | grep --line-buffered "Timing:"
 
 Then dictate a few short, medium, and long utterances and read off the deltas.
 
+## 2026-05-31 — No-speech guard (silence gate before transcribe)
+
+Not a latency optimization per se, but it touches the hot path, so it's logged
+here. Recording toggled on but left silent used to run the full
+transcribe + cleanup + paste pipeline and paste back a hallucinated prompt
+echo. The daemon now measures the recording's RMS amplitude with
+`sox … -n stat` right after the size guard and bails before the transcription
+call when it falls below `silence_rms_threshold` (default `0.01`).
+
+- **Cost on real recordings:** one extra `sox … stat` pass, measured at
+  **~5 ms** on a 3 s / 96 KB clip (reads the file, no network). Negligible
+  next to the ~1.2 s transcribe floor.
+- **Saving on silent recordings:** the entire transcribe + cleanup roundtrip
+  (~1–2.5 s) plus the wasted API spend, now skipped outright.
+- Measured separation (synthetic clips): digital silence RMS ≈ 0.00002,
+  near-silent ambient ≈ 0.0017, a noisy room ≈ 0.011, speech-level ≈ 0.18 —
+  so `0.01` drops silence/quiet ambient with a wide margin under real speech.
+  The measured RMS is logged every recording (`audio RMS … (silence threshold …)`)
+  for tuning.
+- Backstop: a transcript that still comes back empty or equal to the
+  `whisper_prompt` (or one of its sentences) is discarded after transcribe,
+  before cleanup/paste.
+
 ## 2026-05-20 — Optimization pass 1 (client reuse + inline cleanup + skip heuristic)
 
 ### Baseline (pre-change)

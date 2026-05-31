@@ -6,6 +6,7 @@
   "post_transcription_hook": "/Users/YOUR_USER/.config/macwhspr/cleanup.py",
   "paste_after_copy": true,
   "audio_feedback": true,
+  "silence_rms_threshold": 0.01,
   "sample_rate": 16000,
   "rest_timeout": 60
 }
