@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     "error_sound": "Funk",
     "overlay": True,
     "skip_short_cleanup": True,
-    "silence_rms_threshold": 0.01,
+    "silence_rms_threshold": 0.0025,
     "sample_rate": 16000,
     "rest_timeout": 60,
 }

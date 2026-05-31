@@ -9,7 +9,7 @@
   "start_sound": "Tink",
   "stop_sound": "Morse",
   "error_sound": "Funk",
-  "silence_rms_threshold": 0.01,
+  "silence_rms_threshold": 0.0025,
   "sample_rate": 16000,
   "rest_timeout": 60
 }

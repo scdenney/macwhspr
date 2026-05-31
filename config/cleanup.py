@@ -23,7 +23,12 @@ API_URL = os.environ.get(
     'MACWHSPR_LLM_API_URL',
     'https://api.openai.com/v1/chat/completions',
 )
-TIMEOUT_SECONDS = float(os.environ.get('MACWHSPR_LLM_TIMEOUT', '4.0'))
+# Cleanup roundtrip ceiling. 4s was too tight for long dictations (e.g. a full
+# email): gpt-4.1-mini didn't finish in time and the daemon fell back to pasting
+# the raw, unformatted transcript (no paragraph breaks, no register fixes). 12s
+# lets long cleanups complete; short ones still return in ~1s, so this only
+# affects the slow tail. Override with MACWHSPR_LLM_TIMEOUT if needed.
+TIMEOUT_SECONDS = float(os.environ.get('MACWHSPR_LLM_TIMEOUT', '12.0'))
 
 SYSTEM_PROMPT = (
     "You are a text reformatter, not an assistant. Your only function is to take raw "
@@ -103,7 +108,7 @@ def clean(raw: str, http_client: 'httpx.Client | None' = None) -> str:
             {'role': 'system', 'content': SYSTEM_PROMPT + vocab_context()},
             {'role': 'user', 'content': raw},
         ],
-        'max_tokens': 512,
+        'max_tokens': 2048,  # 512 (~380 words) truncated long dictations like emails
         'temperature': 0.1,
     }
     headers = {'Content-Type': 'application/json'}

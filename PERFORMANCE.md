@@ -30,6 +30,28 @@ tail -f ~/Library/Logs/macwhspr.log | grep --line-buffered "Timing:"
 
 Then dictate a few short, medium, and long utterances and read off the deltas.
 
+## 2026-05-31 (evening) — Retune silence threshold; raise cleanup timeout
+
+Real-world use exposed two regressions from the morning's changes:
+
+1. **`silence_rms_threshold` of 0.01 was too high and dropped quiet real
+   speech.** The synthetic-clip analysis (next entry) suggested 0.01 was safe,
+   but a quieter evening dictation session logged RMS of **0.006–0.009** and
+   got discarded as "silent" — six lost recordings before the user flagged it.
+   Daytime speech had measured 0.013–0.023, which masked the problem. Lowered
+   the default to **0.0025**: true silence is ≤0.0012 and real speech ran
+   0.006–0.023, so 0.0025 sits clearly between. Lesson: a fixed RMS gate is
+   mic- and level-dependent, so bias it low — dropping speech is far worse than
+   transcribing the occasional silent clip, and the prompt-echo backstop still
+   catches the silent-hallucination case.
+2. **Cleanup's 4 s timeout fell back to raw on long dictations.** A long email
+   hit `Cleanup call failed: The read operation timed out` and pasted the
+   unformatted transcript — one big blob, no paragraph breaks, no register
+   fixes. Raised the cleanup timeout to **12 s** and `max_tokens` 512 → 2048.
+   Short cleanups still return in ~1 s; only the slow/long tail uses the extra
+   ceiling. Verified: a 430-char run-on blob now cleans in ~1.4 s into four
+   properly-broken paragraphs.
+
 ## 2026-05-31 — No-speech guard (silence gate before transcribe)
 
 Not a latency optimization per se, but it touches the hot path, so it's logged
@@ -45,10 +67,11 @@ call when it falls below `silence_rms_threshold` (default `0.01`).
 - **Saving on silent recordings:** the entire transcribe + cleanup roundtrip
   (~1–2.5 s) plus the wasted API spend, now skipped outright.
 - Measured separation (synthetic clips): digital silence RMS ≈ 0.00002,
-  near-silent ambient ≈ 0.0017, a noisy room ≈ 0.011, speech-level ≈ 0.18 —
-  so `0.01` drops silence/quiet ambient with a wide margin under real speech.
-  The measured RMS is logged every recording (`audio RMS … (silence threshold …)`)
-  for tuning.
+  near-silent ambient ≈ 0.0017, a noisy room ≈ 0.011, speech-level ≈ 0.18.
+  Initial threshold `0.01` — **superseded: real quiet speech later measured
+  0.006–0.009 and got clipped, so it was lowered to 0.0025; see the evening
+  entry above.** The measured RMS is logged every recording
+  (`audio RMS … (silence threshold …)`) for tuning.
 - Backstop: a transcript that still comes back empty or equal to the
   `whisper_prompt` (or one of its sentences) is discarded after transcribe,
   before cleanup/paste.
