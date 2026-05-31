@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
     "language": None,
     "paste_after_copy": True,
     "audio_feedback": True,
+    "start_sound": "Tink",
+    "stop_sound": "Morse",
+    "error_sound": "Funk",
     "overlay": True,
     "skip_short_cleanup": True,
     "silence_rms_threshold": 0.01,
@@ -125,6 +128,9 @@ def play_sound(name: str) -> None:
     if not config.get("audio_feedback", True):
         return
     path = f"/System/Library/Sounds/{name}.aiff"
+    if not os.path.exists(path):
+        log(f"sound not found: {path} (check *_sound in config.json)")
+        return
     subprocess.Popen(
         ["afplay", "-v", "0.3", path],
         stdout=subprocess.DEVNULL,
@@ -289,12 +295,12 @@ def start_recording() -> None:
         )
     except FileNotFoundError:
         log("sox not found. brew install sox")
-        play_sound("Funk")
+        play_sound(config.get("error_sound", "Funk"))
         return
     state = "recording"
     recording_started_at = time.perf_counter()
     log(f"Recording -> {RECORDING_FILE}")
-    play_sound("Tink")
+    play_sound(config.get("start_sound", "Tink"))
     notify_overlay("recording")
 
 
@@ -310,7 +316,7 @@ def stop_and_process() -> None:
             recording_proc.wait()
         recording_proc = None
     t_rec_end = time.perf_counter()
-    play_sound("Pop")
+    play_sound(config.get("stop_sound", "Morse"))
     notify_overlay("transcribing")
 
     if not RECORDING_FILE.exists() or RECORDING_FILE.stat().st_size < 1000:
@@ -351,7 +357,7 @@ def stop_and_process() -> None:
         notify_overlay("done")
     except Exception as exc:
         log(f"Processing failed: {exc}")
-        play_sound("Funk")
+        play_sound(config.get("error_sound", "Funk"))
         notify_overlay("error")
     finally:
         state = "idle"

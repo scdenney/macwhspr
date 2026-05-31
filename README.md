@@ -145,9 +145,10 @@ the Python interpreter inside the venv. Allow it.
 - **Tap Globe** — start recording. You'll hear a soft `Tink` and a red pulsing
   **Recording** pill appears near the top of the screen.
 - **Tap Globe again** — stop, transcribe, clean, paste at the cursor. You'll
-  hear a `Pop`, the pill switches to a blue **Transcribing** spinner, then a
-  brief green **Done** check before fading. If anything fails, you'll hear
-  `Funk`, the pill flashes a red **Error**, and the error will be in the log.
+  hear a short `Morse` beep, the pill switches to a blue **Transcribing**
+  spinner, then a brief green **Done** check before fading. If anything fails,
+  you'll hear `Funk`, the pill flashes a red **Error**, and the error will be
+  in the log.
 - **Ctrl-Cmd-V** — open a chooser of the last ~20 transcripts (read from
   `cleanup_log.jsonl`). Pick one to paste it into the focused field; Esc to
   cancel. Useful when the original paste landed in the wrong window, or when
@@ -156,6 +157,14 @@ the Python interpreter inside the venv. Allow it.
 To turn the overlay off (audio cues only), set `"overlay": false` in
 `~/.config/macwhspr/config.json` and restart the daemon
 (`launchctl kickstart -k gui/$UID/com.macwhspr.daemon`).
+
+The three cues are configurable too: set `"start_sound"`, `"stop_sound"`, or
+`"error_sound"` to any name from `/System/Library/Sounds` (e.g. `Tink`,
+`Morse`, `Pop`, `Bottle`, `Glass`, `Submarine`), or `"audio_feedback": false`
+to mute them entirely. The stop cue defaults to the crisp, short `Morse`
+rather than `Pop`: on Bluetooth headphones macOS plays a device mode-switch
+tone as the mic releases, and the softer `Pop` blended with it into what
+sounded like a doubled beep.
 
 Tail the log:
 
@@ -277,6 +286,7 @@ OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-05-20 | Latency tuning pass 1: cleanup ran as a subprocess and each API call opened a fresh TCP+TLS connection | Persistent `httpx.Client(http2=True)`, inline cleanup, skip-cleanup heuristic for short well-formed transcripts. Details in `PERFORMANCE.md` |
 | 2026-05-21 | No way to re-paste a previous transcript when the original paste landed in the wrong window | Added `Ctrl-Cmd-V` chooser in `hammerspoon_macwhspr.lua` over the last 20 entries in `cleanup_log.jsonl` |
 | 2026-05-31 | Toggling recording on without saying anything pasted the prompt text back (`gpt-4o-transcribe` hallucinates the `whisper_prompt` on silence) | Daemon drops silent clips (RMS below `silence_rms_threshold`, default `0.01`) before transcribing, and discards any transcript that is empty or just echoes the prompt or one of its sentences. Tune via `silence_rms_threshold` in `config.json`; the measured RMS is logged each recording |
+| 2026-05-31 | Stop/transcribe tap sounded like a doubled, overlapping beep (most noticeable on AirPods/Beats) | Not a macwhspr bug — macOS plays a Bluetooth mic→output mode-switch tone as the mic releases, layering on the soft `Pop`. Changed the default `stop_sound` to the crisper, shorter `Morse` so it no longer blends, and made `start_sound`/`stop_sound`/`error_sound` configurable in `config.json` |
 
 ## Relationship to the Linux setup
 

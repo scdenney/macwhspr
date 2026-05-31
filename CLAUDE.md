@@ -36,6 +36,7 @@ differs.
 - Skip-cleanup heuristic: short (<80 chars), well-formed transcripts bypass the cleanup API and are still logged to `cleanup_log.jsonl` with `"skipped": true`. Toggle via `"skip_short_cleanup": false` in `config.json`.
 - No-speech guard: a recording toggled on but left silent is dropped before transcription if its RMS amplitude (measured with `sox … stat`) falls below `"silence_rms_threshold"` (default `0.01`; set `0` to disable). As a backstop, any transcript that comes back empty or just echoes the `whisper_prompt` (or one of its sentences) is also discarded — `gpt-4o-transcribe` parrots the prompt on near-silent audio. Both paths log to `macwhspr.log`, paste nothing, and skip `cleanup_log.jsonl`. The measured RMS is logged every recording so the threshold can be tuned.
 - Recording uses `sox -d -r 16000 -c 1 -b 16` (requires `brew install sox`)
+- Audio cues: `start_sound`/`stop_sound`/`error_sound` in `config.json` (any `/System/Library/Sounds` name; `audio_feedback:false` mutes). Default stop is `Morse`, not `Pop`, because `Pop` is a soft bloop that blended with the Bluetooth mic→output mode-switch tone (mic released on stop) into an apparent double-beep. `play_sound()` logs and skips if the named file is missing.
 - Paste uses `pbcopy` + `osascript` keystroke (needs Accessibility permission)
 - When making changes to the daemon: `launchctl kickstart -k gui/$UID/com.macwhspr.daemon`
 - After editing `~/.hammerspoon/macwhspr.lua`: menu bar hammer → Reload Config (the bootstrap in init.lua re-requires the module on each reload)
