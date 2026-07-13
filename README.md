@@ -1,13 +1,24 @@
-# macwhspr — Mac voice-to-text setup
+# macwhspr
 
-This is the macOS counterpart to
-[`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr) (the Linux
-setup). It is not an application or package — it is a reproducible
-configuration pattern: Globe-key triggered voice recording, OpenAI
+[![platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](https://github.com/scdenney/macwhspr)
+[![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![transcription](https://img.shields.io/badge/transcription-gpt--realtime--whisper-111111?logo=openai&logoColor=white)](https://platform.openai.com/docs/guides/speech-to-text)
+[![updated](https://img.shields.io/badge/updated-July%202026-green)](https://github.com/scdenney/macwhspr/commits)
+[![Linux counterpart](https://img.shields.io/badge/Linux%20counterpart-hyperwhspr-FCC624?logo=linux&logoColor=black)](https://github.com/scdenney/hyperwhspr)
+
+Dictation-first voice-to-text for the Mac, and the macOS counterpart to
+[`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr). This
+repository is not an application or package. It is a reproducible
+configuration pattern: Globe-key triggered recording, streaming OpenAI
 transcription, post-transcription LLM cleanup, and a calibration loop for
-vocabulary, style, and written prosody. Same pipeline as the Linux setup,
-system glue swapped for Mac-native pieces (Karabiner-Elements, Hammerspoon,
-launchd, sox).
+vocabulary, style, and written prosody. Tap the Globe key, speak, tap again,
+and the cleaned-up text lands at your cursor about a second later. Same
+pipeline as the Linux setup, with the system glue swapped for Mac-native
+pieces (Karabiner-Elements, Hammerspoon, launchd, sox).
+
+[Pipeline](#pipeline) · [Install](#install) · [Daily use](#daily-use) · [OpenAI API setup](#openai-api-setup) · [Calibration](#calibration-loop) · [Known issues](#known-issues-and-fixes) · [vs Linux](#relationship-to-the-linux-setup)
+
+---
 
 ## Pipeline
 
@@ -81,12 +92,21 @@ venv so the system Python stays clean.
 
 ## Install
 
+You need macOS with [Homebrew](https://brew.sh), the three
+[prerequisite packages](#prerequisites) above, and an
+[OpenAI API key](https://platform.openai.com/api-keys).
+
 ```bash
-cd o_macos/macwhspr
+git clone https://github.com/scdenney/macwhspr
+cd macwhspr
 ./setup.sh
 ```
 
-Then the manual steps the script prints at the end. In order:
+The script is idempotent: it creates the venv, copies everything from
+[What gets installed](#what-gets-installed) into place, and prints the manual
+steps it cannot do for you. Five steps remain, in order: store your API key,
+free the Globe key, enable the Karabiner rule, reload Hammerspoon, start the
+daemon.
 
 ### 1. Store your OpenAI API key
 
@@ -145,6 +165,33 @@ launchctl print gui/$UID/com.macwhspr.daemon | head
 
 The first recording will trigger the macOS microphone permission prompt for
 the Python interpreter inside the venv. Allow it.
+
+The `launchctl print` line should show `state = running`. Test it: focus any
+text field, tap the Globe key, speak a sentence, tap again. You'll hear the
+start and stop cues, the pill cycles Recording → Transcribing → Done, and the
+cleaned-up text pastes at your cursor about a second after you stop. If
+nothing pastes, check `tail -f ~/Library/Logs/macwhspr.log` and see
+[Known issues](#known-issues-and-fixes).
+
+### Install with an agent
+
+The scripted parts of this install can be run by a coding agent. Paste this
+into Claude Code or Codex on the Mac:
+
+```text
+Install macwhspr from https://github.com/scdenney/macwhspr: install the brew
+prerequisites from the README, clone the repo, run ./setup.sh, then walk me
+through the remaining manual steps one at a time. Skip the Keychain command
+in step 1; I will add the API key myself. Steps 2-4 are System Settings,
+Karabiner, and Hammerspoon permission prompts that I have to click, so tell
+me what to do and wait for my confirmation. Finish by starting the daemon
+(step 5) and showing me `launchctl print gui/$UID/com.macwhspr.daemon`.
+```
+
+The agent can run brew, the installer, and launchctl. A human is still needed
+at the screen for the API key and the GUI permission steps: macOS prompts for
+Accessibility, Input Monitoring, the microphone, and the Keychain cannot be
+clicked by an agent, and your key should not pass through the conversation.
 
 ## Daily use
 
