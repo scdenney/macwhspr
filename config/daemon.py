@@ -9,8 +9,16 @@ State machine:
 
 PID is written to ~/.config/macwhspr/daemon.pid. Hammerspoon (or any other
 trigger) signals the PID with SIGUSR1 to toggle.
+
+Two transcription backends (config "transcription_backend"):
+  "realtime-ws" (default) - streams audio to OpenAI's Realtime WebSocket API
+      (gpt-realtime-whisper) as sox captures it, so transcription is mostly
+      done by the time the user stops talking. See realtime_client.py.
+  "rest-api" - the original batch path: record a full WAV, then POST it to
+      /v1/audio/transcriptions (gpt-4o-transcribe) after recording stops.
 """
 
+import array
 import json
 import os
 import re
@@ -18,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -31,9 +40,12 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CREDENTIALS_FILE = DATA_DIR / "credentials"
 RECORDING_FILE = Path(tempfile.gettempdir()) / "macwhspr_recording.wav"
 HS_CLI = Path("/opt/homebrew/bin/hs")
+REALTIME_SAMPLE_RATE = 24000  # required by OpenAI's Realtime transcription API
+REALTIME_CHUNK_BYTES = 4800  # ~100ms at 24kHz/16-bit/mono
 
-# cleanup.py lives next to this file in the install directory. Add the install
-# dir to sys.path so we can `import cleanup` and call it inline (no subprocess).
+# cleanup.py and realtime_client.py live next to this file in the install
+# directory. Add the install dir to sys.path so we can import them inline
+# (no subprocess).
 sys.path.insert(0, str(CONFIG_DIR.resolve()))
 try:
     import cleanup as cleanup_mod  # type: ignore
@@ -43,9 +55,22 @@ except Exception as _cleanup_import_exc:
 else:
     _cleanup_import_error = None
 
+try:
+    import realtime_client as realtime_client_mod  # type: ignore
+except Exception as _realtime_import_exc:
+    realtime_client_mod = None
+    _realtime_import_error = _realtime_import_exc
+else:
+    _realtime_import_error = None
+
 DEFAULT_CONFIG = {
+    "transcription_backend": "realtime-ws",  # "realtime-ws" or "rest-api"
     "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
     "transcription_model": "gpt-4o-transcribe",
+    "realtime_url": "wss://api.openai.com/v1/realtime?intent=transcription",
+    "realtime_model": "gpt-realtime-whisper",
+    "realtime_timeout": 30,
+    "realtime_buffer_max_seconds": 5,
     "whisper_prompt": "Transcribe accurately. The speaker is an assistant professor in programming research and computer science.",
     "language": None,
     "paste_after_copy": True,
@@ -65,6 +90,12 @@ recording_proc = None
 recording_started_at = 0.0
 config = {}
 _http_client: "httpx.Client | None" = None
+
+# Realtime backend state
+_realtime_client = None  # realtime_client_mod.RealtimeClient instance, connected once at startup
+_realtime_reader_thread = None
+_realtime_pcm_chunks: list = []  # accumulated raw PCM16 bytes for the in-progress recording
+_realtime_pcm_lock = threading.Lock()
 
 # Whole-word filler tokens that disqualify a transcript from the skip-cleanup
 # heuristic (matches the Linux setup's filler_words list).
@@ -163,6 +194,36 @@ def close_http_client() -> None:
             _http_client = None
 
 
+def using_realtime_backend() -> bool:
+    return config.get("transcription_backend", "realtime-ws") == "realtime-ws"
+
+
+def connect_realtime_client() -> None:
+    """Connect the persistent Realtime WebSocket client. Called once at startup.
+
+    Reconnection on unexpected drops is handled inside RealtimeClient; this
+    is only the initial connect. If it fails, recordings will error out
+    until the daemon is restarted (matches hyprwhspr's behavior on Linux).
+    """
+    global _realtime_client
+    if realtime_client_mod is None:
+        log(
+            "WARNING: realtime_client module not importable "
+            f"({_realtime_import_error}); transcription_backend=realtime-ws will fail. "
+            "Falling back is not automatic -- set transcription_backend to rest-api."
+        )
+        return
+    _realtime_client = realtime_client_mod.RealtimeClient(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        max_buffer_seconds=config.get("realtime_buffer_max_seconds", 5),
+    )
+    ok = _realtime_client.connect(
+        config["realtime_url"], api_key(), config["realtime_model"]
+    )
+    if not ok:
+        log("ERROR: failed to connect Realtime WebSocket at startup")
+
+
 def should_skip_cleanup(raw: str) -> bool:
     """True if the raw transcript looks already-clean enough to skip cleanup.
 
@@ -194,6 +255,7 @@ def measure_rms(path: Path) -> "float | None":
 
     Fail-soft: any sox/parse error returns None so callers treat the level as
     unknown and transcribe anyway rather than dropping audio on a glitch.
+    Used only by the rest-api backend, which records to a WAV file.
     """
     try:
         result = subprocess.run(
@@ -213,20 +275,33 @@ def measure_rms(path: Path) -> "float | None":
     return None
 
 
-def recording_is_silent(path: Path) -> bool:
-    """True if the recording carries no speech-level energy.
+def rms_of_pcm16(chunks: list) -> float:
+    """Pure-Python RMS amplitude (0..1) of concatenated PCM16 mono chunks.
 
-    Toggling recording on and saying nothing still yields a multi-second WAV
-    that clears the size guard. Fed near-silence, gpt-4o-transcribe tends to
-    hallucinate -- usually by parroting the whisper prompt back -- so we drop
-    the clip before spending the transcription call. The threshold is
-    configurable (silence_rms_threshold); set it to 0 to disable. The measured
-    level is logged so it can be tuned against real recordings.
+    Used by the realtime-ws backend, which streams raw PCM in memory rather
+    than writing a WAV file, so there's no on-disk file for `sox ... stat`.
+    """
+    samples = array.array("h")
+    for chunk in chunks:
+        samples.frombytes(chunk)
+    if not samples:
+        return 0.0
+    sum_sq = sum(s * s for s in samples)
+    return (sum_sq / len(samples)) ** 0.5 / 32768.0
+
+
+def recording_is_silent_rms(rms: "float | None") -> bool:
+    """True if the given RMS amplitude carries no speech-level energy.
+
+    Toggling recording on and saying nothing still yields a clip that clears
+    the size guard. Fed near-silence, transcription models tend to
+    hallucinate, so we drop the clip before spending the transcription call.
+    The threshold is configurable (silence_rms_threshold); set it to 0 to
+    disable.
     """
     threshold = config.get("silence_rms_threshold", 0.01)
     if not threshold or threshold <= 0:
         return False
-    rms = measure_rms(path)
     if rms is None:
         return False  # couldn't measure -> don't block transcription
     log(f"audio RMS {rms:.5f} (silence threshold {threshold})")
@@ -241,12 +316,18 @@ def _normalize_for_match(text: str) -> str:
 def is_prompt_echo(raw: str) -> bool:
     """True if the transcript is empty or just echoes the whisper prompt.
 
-    On near-silent audio gpt-4o-transcribe sometimes returns the prompt it was
-    handed instead of empty text. Observed forms (see cleanup_log.jsonl
-    history) are the full prompt and either of its sentences alone. We drop the
-    transcript when, normalized, it is empty or exactly equals the whole prompt
-    or any one of its sentences. Exact-match only, so genuine dictation -- even
-    sentences that reuse prompt vocabulary -- is never affected.
+    On near-silent audio, batch transcription (gpt-4o-transcribe) sometimes
+    returns the prompt it was handed instead of empty text. Observed forms
+    (see cleanup_log.jsonl history) are the full prompt and either of its
+    sentences alone. We drop the transcript when, normalized, it is empty or
+    exactly equals the whole prompt or any one of its sentences. Exact-match
+    only, so genuine dictation -- even sentences that reuse prompt
+    vocabulary -- is never affected.
+
+    Note: whisper_prompt is not sent at all under the realtime-ws backend
+    (gpt-realtime-whisper doesn't support prompt/vocabulary steering in GA
+    Realtime sessions), so this specific hallucination mode shouldn't occur
+    there, but the empty-transcript check still applies.
     """
     n_raw = _normalize_for_match(raw)
     if not n_raw:
@@ -276,30 +357,73 @@ def notify_overlay(state_name: str) -> None:
         log(f"overlay notify failed: {exc}")
 
 
+def _realtime_reader_loop(proc: subprocess.Popen) -> None:
+    """Background thread: read raw PCM16 from sox's stdout, stream + buffer it.
+
+    Runs for the lifetime of one recording. Exits when sox's stdout closes
+    (on terminate/kill in stop_and_process).
+    """
+    while True:
+        chunk = proc.stdout.read(REALTIME_CHUNK_BYTES)
+        if not chunk:
+            return
+        with _realtime_pcm_lock:
+            _realtime_pcm_chunks.append(chunk)
+        if _realtime_client is not None:
+            _realtime_client.append_audio(chunk)
+
+
 def start_recording() -> None:
-    global recording_proc, state, recording_started_at
-    RECORDING_FILE.unlink(missing_ok=True)
+    global recording_proc, state, recording_started_at, _realtime_reader_thread
     rate = str(config.get("sample_rate", 16000))
-    try:
-        recording_proc = subprocess.Popen(
-            [
-                "sox", "-d",
-                "-r", rate,
-                "-c", "1",
-                "-b", "16",
-                "-e", "signed-integer",
-                str(RECORDING_FILE),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    if using_realtime_backend():
+        with _realtime_pcm_lock:
+            _realtime_pcm_chunks.clear()
+        if _realtime_client is not None:
+            _realtime_client.clear_audio_buffer()
+        try:
+            recording_proc = subprocess.Popen(
+                [
+                    "sox", "-d",
+                    "-r", str(REALTIME_SAMPLE_RATE),
+                    "-c", "1",
+                    "-b", "16",
+                    "-e", "signed-integer",
+                    "-t", "raw", "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            log("sox not found. brew install sox")
+            play_sound(config.get("error_sound", "Funk"))
+            return
+        _realtime_reader_thread = threading.Thread(
+            target=_realtime_reader_loop, args=(recording_proc,), daemon=True
         )
-    except FileNotFoundError:
-        log("sox not found. brew install sox")
-        play_sound(config.get("error_sound", "Funk"))
-        return
+        _realtime_reader_thread.start()
+    else:
+        RECORDING_FILE.unlink(missing_ok=True)
+        try:
+            recording_proc = subprocess.Popen(
+                [
+                    "sox", "-d",
+                    "-r", rate,
+                    "-c", "1",
+                    "-b", "16",
+                    "-e", "signed-integer",
+                    str(RECORDING_FILE),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            log("sox not found. brew install sox")
+            play_sound(config.get("error_sound", "Funk"))
+            return
     state = "recording"
     recording_started_at = time.perf_counter()
-    log(f"Recording -> {RECORDING_FILE}")
+    log(f"Recording ({config.get('transcription_backend', 'realtime-ws')})")
     play_sound(config.get("start_sound", "Tink"))
     notify_overlay("recording")
 
@@ -315,28 +439,47 @@ def stop_and_process() -> None:
             recording_proc.kill()
             recording_proc.wait()
         recording_proc = None
+    if _realtime_reader_thread is not None:
+        _realtime_reader_thread.join(timeout=2.0)
     t_rec_end = time.perf_counter()
     play_sound(config.get("stop_sound", "Morse"))
     notify_overlay("transcribing")
 
-    if not RECORDING_FILE.exists() or RECORDING_FILE.stat().st_size < 1000:
-        log("Recording too short, skipping")
-        notify_overlay("hide")
-        state = "idle"
-        return
+    realtime = using_realtime_backend()
 
-    if recording_is_silent(RECORDING_FILE):
-        log("No speech detected (silent recording), skipping")
-        notify_overlay("hide")
-        state = "idle"
-        return
+    if realtime:
+        with _realtime_pcm_lock:
+            total_bytes = sum(len(c) for c in _realtime_pcm_chunks)
+            chunks_snapshot = list(_realtime_pcm_chunks)
+        if total_bytes < 1000:
+            log("Recording too short, skipping")
+            notify_overlay("hide")
+            state = "idle"
+            return
+        if recording_is_silent_rms(rms_of_pcm16(chunks_snapshot)):
+            log("No speech detected (silent recording), skipping")
+            notify_overlay("hide")
+            state = "idle"
+            return
+        audio_kb = total_bytes / 1024.0
+    else:
+        if not RECORDING_FILE.exists() or RECORDING_FILE.stat().st_size < 1000:
+            log("Recording too short, skipping")
+            notify_overlay("hide")
+            state = "idle"
+            return
+        if recording_is_silent_rms(measure_rms(RECORDING_FILE)):
+            log("No speech detected (silent recording), skipping")
+            notify_overlay("hide")
+            state = "idle"
+            return
+        audio_kb = RECORDING_FILE.stat().st_size / 1024.0
 
     rec_duration = t_rec_end - recording_started_at
-    audio_kb = RECORDING_FILE.stat().st_size / 1024.0
 
     try:
         t0 = time.perf_counter()
-        raw = transcribe()
+        raw = transcribe_realtime() if realtime else transcribe_rest()
         t1 = time.perf_counter()
         if not raw or is_prompt_echo(raw):
             log(f"No speech detected (empty or prompt echo): {raw[:80]!r}")
@@ -363,7 +506,16 @@ def stop_and_process() -> None:
         state = "idle"
 
 
-def transcribe() -> str:
+def transcribe_realtime() -> str:
+    if _realtime_client is None or not _realtime_client.connected:
+        log("Realtime client not connected, attempting reconnect")
+        connect_realtime_client()
+    if _realtime_client is None or not _realtime_client.connected:
+        raise RuntimeError("Realtime WebSocket unavailable")
+    return _realtime_client.commit_and_get_text(timeout=config.get("realtime_timeout", 30))
+
+
+def transcribe_rest() -> str:
     key = api_key()
     client = get_http_client()
     with open(RECORDING_FILE, "rb") as fh:
@@ -455,6 +607,8 @@ def handle_shutdown(signum, frame) -> None:
     if recording_proc:
         recording_proc.terminate()
     close_http_client()
+    if _realtime_client is not None:
+        _realtime_client.close()
     PID_FILE.unlink(missing_ok=True)
     sys.exit(0)
 
@@ -470,6 +624,8 @@ def main() -> None:
             "WARNING: cleanup module not importable "
             f"({_cleanup_import_error}); transcripts will be pasted raw."
         )
+    if using_realtime_backend():
+        connect_realtime_client()
     signal.signal(signal.SIGUSR1, handle_toggle)
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)

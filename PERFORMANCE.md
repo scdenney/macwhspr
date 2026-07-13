@@ -30,6 +30,43 @@ tail -f ~/Library/Logs/macwhspr.log | grep --line-buffered "Timing:"
 
 Then dictate a few short, medium, and long utterances and read off the deltas.
 
+## 2026-07-13 — Realtime streaming transcription (the flat-latency change)
+
+Switched the default backend from batch REST (`gpt-4o-transcribe`, upload the
+finished WAV after stop) to OpenAI's Realtime WebSocket
+(`gpt-realtime-whisper`, stream raw PCM while recording, commit on stop). New
+`realtime_client.py`; `daemon.py` records at 24 kHz raw for this path and
+keeps the WAV/REST path behind `"transcription_backend": "rest-api"`.
+
+Why it matters for latency: the batch roundtrip scales with audio length
+(upload + transcribe a whole file), while realtime does almost all the work
+during the recording itself. Under `realtime-ws` the `transcribe=` component
+of the timing line measures commit → final transcript, which is now the whole
+transcription wait.
+
+Measured on identical audio (SSH harness: `say`-generated speech at 22.05 kHz,
+resampled to 24 kHz PCM, streamed at 1× realtime pacing to mimic mic capture;
+key from stdin; N=1 per cell, same network, same afternoon):
+
+| Audio length | Batch REST roundtrip | Realtime post-stop wait |
+| --- | --- | --- |
+| 6.5 s | 1.67 s | 0.91 s |
+| 28.0 s | 2.38 s | 0.98 s |
+| 93.9 s | 5.87 s | 0.93 s |
+
+Production logs agree on the batch side: real 100–153 s dictations logged
+`transcribe=` 3.57–5.87 s. The realtime wait is flat at ~0.9–1.0 s regardless
+of dictation length — on a two-minute dictation that's ~5 s of perceived
+latency gone, and the longer the dictation the bigger the win.
+
+Costs and caveats: $0.017/min vs $0.006/min (≈3× per minute, still pennies per
+day at dictation volumes); `whisper_prompt` does not apply (no
+prompt/vocabulary steering in GA Realtime sessions — vocab correction stays in
+`cleanup.py`); the silence gate on this path computes RMS in pure Python over
+the in-memory PCM instead of `sox … stat` (no WAV exists), measured at 16 ms
+for a 28 s clip and 51 ms for a 94 s one — same order as the ~5 ms sox pass it
+replaces and negligible against the ~0.95 s transcription wait.
+
 ## 2026-05-31 (evening) — Retune silence threshold; raise cleanup timeout
 
 Real-world use exposed two regressions from the morning's changes:

@@ -19,8 +19,9 @@ bold "1/7  Create directories"
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LAUNCH_AGENT_DIR" "$KARABINER_ASSETS" "$HAMMERSPOON_DIR"
 
 bold "2/7  Copy scripts and config"
-cp "$REPO_DIR/config/daemon.py"  "$CONFIG_DIR/daemon.py"
-cp "$REPO_DIR/config/cleanup.py" "$CONFIG_DIR/cleanup.py"
+cp "$REPO_DIR/config/daemon.py"          "$CONFIG_DIR/daemon.py"
+cp "$REPO_DIR/config/cleanup.py"         "$CONFIG_DIR/cleanup.py"
+cp "$REPO_DIR/config/realtime_client.py" "$CONFIG_DIR/realtime_client.py"
 chmod +x "$CONFIG_DIR/daemon.py" "$CONFIG_DIR/cleanup.py"
 if [ ! -f "$CONFIG_DIR/vocab.md" ]; then
     cp "$REPO_DIR/config/vocab.md" "$CONFIG_DIR/vocab.md"
@@ -35,14 +36,15 @@ else
     note "Kept existing $CONFIG_DIR/config.json"
 fi
 
-bold "3/7  Python venv with httpx[http2]"
+bold "3/7  Python venv with httpx[http2] + websocket-client"
 if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
 fi
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 # httpx[http2] pulls in h2 so the daemon can multiplex transcription + cleanup
 # over a single persistent connection (latency optimization, see PERFORMANCE.md).
-"$VENV_DIR/bin/pip" install --quiet 'httpx[http2]'
+# websocket-client backs realtime_client.py (transcription_backend: realtime-ws).
+"$VENV_DIR/bin/pip" install --quiet 'httpx[http2]' 'websocket-client>=1.6.0'
 
 bold "4/7  launchd plist"
 sed "s|/Users/YOUR_USER|$HOME|g" "$REPO_DIR/config/com.macwhspr.daemon.plist" > "$PLIST_DEST"

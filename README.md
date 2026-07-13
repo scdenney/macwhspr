@@ -15,27 +15,32 @@ launchd, sox).
 Globe tap
    │  (Karabiner-Elements: Fn tap → F18)
    ▼
-Hammerspoon  ◄────────────────────────────┐
-   │  (kill -USR1 <daemon pid>)           │ overlay updates
-   ▼                                      │ via `hs -c` IPC
-macwhspr daemon  ──►  sox records to wav  │
-       │
-       │   persistent httpx.Client(http2=True), reused for both calls
-       ▼
-                 ──►  OpenAI gpt-4o-transcribe
+Hammerspoon  ◄─────────────────────────────────┐
+   │  (kill -USR1 <daemon pid>)                │ overlay updates
+   ▼                                           │ via `hs -c` IPC
+macwhspr daemon  ──►  sox captures raw PCM     │
+       │              │ streamed while you speak
+       │              ▼
+       │         OpenAI Realtime WebSocket (gpt-realtime-whisper)
+       │              │ commit on stop → transcript ~1s later
+       ▼              ▼
                  ──►  (cleanup inline; skipped for short, well-formed text)
                  ──►  pbcopy → osascript paste
-                 ──►  notify_overlay() ───┘
+                 ──►  notify_overlay() ────────┘
 ```
 
-Tap once: start recording. Tap again: stop, transcribe, clean (or skip), paste
-at the cursor. A small floating pill (rendered by Hammerspoon's `hs.canvas`)
-shows the current state — red pulsing **Recording**, blue **Transcribing**
-spinner, green **Done** check.
+Tap once: start recording; audio streams to the transcription session as you
+speak. Tap again: stop, commit, clean (or skip), paste at the cursor. A small
+floating pill (rendered by Hammerspoon's `hs.canvas`) shows the current
+state — red pulsing **Recording**, blue **Transcribing** spinner, green
+**Done** check.
 
-Latency choices live in `PERFORMANCE.md`. The short version: cleanup runs in
-the same Python process as the daemon, and both API calls share a single
-HTTP/2 connection that stays open between recordings.
+Latency choices live in `PERFORMANCE.md`. The short version: transcription
+streams over a persistent WebSocket while you talk, so the wait after you
+stop is ~1s regardless of how long you spoke; cleanup runs in the same Python
+process as the daemon over a persistent HTTP/2 connection. The older batch
+path (upload a finished WAV after stop) remains available as a fallback via
+`"transcription_backend": "rest-api"`.
 
 ## Why this setup over an existing app
 
@@ -51,9 +56,10 @@ machines.
 | --- | --- |
 | `~/.config/macwhspr/daemon.py` | `config/daemon.py` |
 | `~/.config/macwhspr/cleanup.py` | `config/cleanup.py` |
+| `~/.config/macwhspr/realtime_client.py` | `config/realtime_client.py` |
 | `~/.config/macwhspr/config.json` | `config/config.json` |
 | `~/.config/macwhspr/vocab.md` | `config/vocab.md` (only if missing) |
-| `~/.local/share/macwhspr/venv/` | Python 3 venv with `httpx` |
+| `~/.local/share/macwhspr/venv/` | Python 3 venv with `httpx` + `websocket-client` |
 | `~/.local/share/macwhspr/credentials` | Created by hand, contains OpenAI key |
 | `~/Library/LaunchAgents/com.macwhspr.daemon.plist` | `config/com.macwhspr.daemon.plist` |
 | `~/.config/karabiner/assets/complex_modifications/macwhspr.json` | `config/karabiner.json` |
@@ -188,20 +194,49 @@ launchctl bootout gui/$UID/com.macwhspr.daemon
 
 ## OpenAI API setup
 
-The example config uses OpenAI's speech-to-text endpoint with
-`gpt-4o-transcribe`. OpenAI's audio docs describe the endpoint and supported
-models:
+The example config uses OpenAI's Realtime WebSocket transcription model,
+`gpt-realtime-whisper`, streaming audio while you speak. OpenAI's audio docs
+describe the endpoints and supported models:
 <https://platform.openai.com/docs/guides/speech-to-text>.
 
 The relevant config block in `~/.config/macwhspr/config.json`:
 
 ```json
 {
+  "transcription_backend": "realtime-ws",
+  "realtime_url": "wss://api.openai.com/v1/realtime?intent=transcription",
+  "realtime_model": "gpt-realtime-whisper",
+  "realtime_timeout": 30,
+  "realtime_buffer_max_seconds": 5
+}
+```
+
+`whisper_prompt` does **not** apply under `realtime-ws` —
+`gpt-realtime-whisper` does not support prompt/vocabulary steering in GA
+Realtime sessions (per OpenAI's Realtime transcription guide). Domain
+vocabulary correction happens downstream in `cleanup.py` via `vocab.md`.
+
+### Batch REST fallback
+
+The original batch path is still wired in and can be simpler to reason about
+if the WebSocket gives trouble on a given network. Set
+`"transcription_backend": "rest-api"` and the daemon uploads the finished
+WAV after you stop:
+
+```json
+{
+  "transcription_backend": "rest-api",
   "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
   "transcription_model": "gpt-4o-transcribe",
   "whisper_prompt": "Transcribe accurately. ..."
 }
 ```
+
+Under `rest-api`, `whisper_prompt` is sent as the batch `prompt` field and
+does bias vocabulary. Measured on the same audio, the realtime path returns
+the transcript ~1s after stop regardless of dictation length, while the
+batch roundtrip grows with audio length (see `PERFORMANCE.md` for numbers);
+realtime costs more per minute ($0.017/min vs $0.006/min as of July 2026).
 
 Cleanup defaults to `gpt-4.1-mini` via the OpenAI Chat Completions API. The
 model and endpoint are set as environment variables in the launchd plist:
@@ -273,9 +308,9 @@ Note that this edit is to the installed module, not the repo. Re-running
 
 The daemon currently calls the OpenAI transcription API. For local
 transcription on Apple Silicon, the simplest swap is `whisper.cpp` with its
-Core ML / Metal build. The daemon's `transcribe()` function would shell out to
-`./main -m models/ggml-base.en.bin -f recording.wav -nt` instead of POSTing to
-OpenAI. Not wired up here; flagged as a known follow-up.
+Core ML / Metal build. The daemon's `transcribe_rest()` function would shell
+out to `./main -m models/ggml-base.en.bin -f recording.wav -nt` instead of
+POSTing to OpenAI. Not wired up here; flagged as a known follow-up.
 
 ## Known issues and fixes
 
@@ -288,6 +323,7 @@ OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-05-31 | Toggling recording on without saying anything pasted the prompt text back (`gpt-4o-transcribe` hallucinates the `whisper_prompt` on silence) | Daemon drops silent clips (RMS below `silence_rms_threshold`, default `0.0025`) before transcribing, and discards any transcript that is empty or just echoes the prompt or one of its sentences. Tune via `silence_rms_threshold` in `config.json`; the measured RMS is logged each recording |
 | 2026-05-31 | Stop/transcribe tap sounded like a doubled, overlapping beep (most noticeable on AirPods/Beats) | Not a macwhspr bug — macOS plays a Bluetooth mic→output mode-switch tone as the mic releases, layering on the soft `Pop`. Changed the default `stop_sound` to the crisper, shorter `Morse` so it no longer blends, and made `start_sound`/`stop_sound`/`error_sound` configurable in `config.json` |
 | 2026-05-31 | Silence guard clipped quiet real speech as "silent" (nothing pasted); long email dictations pasted as one unformatted blob | `silence_rms_threshold` of `0.01` sat inside real speech levels — quiet dictation logged 0.006–0.009 RMS and got dropped. Lowered the default to `0.0025` (true silence ≤0.0012, speech 0.006–0.02). Separately, the 4 s cleanup timeout fell back to raw text on long dictations: raised it to 12 s and `max_tokens` 512→2048 so long emails get formatted instead of blobbed |
+| 2026-07-13 | Switched to realtime streaming transcription (`gpt-realtime-whisper` over the Realtime WebSocket), mirroring the Linux setup's move the same day | New `realtime_client.py` (transcribe-only port of hyprwhspr's client; bytes-based, no numpy — the daemon records at 24 kHz natively for this backend so no resampling); `daemon.py` grew a `realtime-ws` path that streams sox's raw PCM while recording and commits on stop. Verified over SSH with `say`-generated speech clips streamed at 1× pacing: 6.5 s / 28 s / 94 s of audio all returned accurate transcripts **0.91–0.98 s after stop**, vs 1.67 s / 2.38 s / 5.87 s for the same clips through the batch REST path (and 3.6–5.9 s in production logs for real 100–150 s dictations). Silence guard now computes RMS in pure Python over the in-memory PCM (no WAV file exists on this path). `whisper_prompt` does not apply under realtime (no prompt support in GA Realtime sessions); vocab correction remains in `cleanup.py`. Batch path kept as `"transcription_backend": "rest-api"` |
 
 ## Relationship to the Linux setup
 

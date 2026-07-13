@@ -1,6 +1,11 @@
 {
+  "transcription_backend": "realtime-ws",
   "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
   "transcription_model": "gpt-4o-transcribe",
+  "realtime_url": "wss://api.openai.com/v1/realtime?intent=transcription",
+  "realtime_model": "gpt-realtime-whisper",
+  "realtime_timeout": 30,
+  "realtime_buffer_max_seconds": 5,
   "whisper_prompt": "Transcribe accurately. The speaker is an assistant professor in programming research and computer science.",
   "language": null,
   "post_transcription_hook": "/Users/YOUR_USER/.config/macwhspr/cleanup.py",
