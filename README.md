@@ -2,8 +2,8 @@
 
 [![platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](https://github.com/scdenney/macwhspr)
 [![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
-[![transcription](https://img.shields.io/badge/transcription-gpt--realtime--whisper-111111?logo=openai&logoColor=white)](https://platform.openai.com/docs/guides/speech-to-text)
-[![updated](https://img.shields.io/badge/updated-July%202026-green)](https://github.com/scdenney/macwhspr/commits)
+[![transcription](https://img.shields.io/badge/transcription-gpt--live--transcribe-111111?logo=openai&logoColor=white)](https://developers.openai.com/api/docs/guides/realtime-transcription)
+[![updated](https://img.shields.io/badge/updated-September%202026-green)](https://github.com/scdenney/macwhspr/commits)
 [![Linux counterpart](https://img.shields.io/badge/Linux%20counterpart-hyperwhspr-FCC624?logo=linux&logoColor=black)](https://github.com/scdenney/hyperwhspr)
 
 Dictation-first voice-to-text for the Mac, and the macOS counterpart to
@@ -32,7 +32,7 @@ Hammerspoon  ◄─────────────────────�
 macwhspr daemon  ──►  sox captures raw PCM     │
        │              │ streamed while you speak
        │              ▼
-       │         OpenAI Realtime WebSocket (gpt-realtime-whisper)
+       │         OpenAI Realtime WebSocket (gpt-live-transcribe)
        │              │ commit on stop → transcript ~1s later
        ▼              ▼
                  ──►  (cleanup inline; skipped for short, well-formed text)
@@ -242,9 +242,9 @@ launchctl bootout gui/$UID/com.macwhspr.daemon
 ## OpenAI API setup
 
 The example config uses OpenAI's Realtime WebSocket transcription model,
-`gpt-realtime-whisper`, streaming audio while you speak. OpenAI's audio docs
+`gpt-live-transcribe`, streaming audio while you speak. OpenAI's audio docs
 describe the endpoints and supported models:
-<https://platform.openai.com/docs/guides/speech-to-text>.
+<https://developers.openai.com/api/docs/guides/realtime-transcription>.
 
 The relevant config block in `~/.config/macwhspr/config.json`:
 
@@ -252,16 +252,31 @@ The relevant config block in `~/.config/macwhspr/config.json`:
 {
   "transcription_backend": "realtime-ws",
   "realtime_url": "wss://api.openai.com/v1/realtime?intent=transcription",
-  "realtime_model": "gpt-realtime-whisper",
+  "realtime_model": "gpt-live-transcribe",
   "realtime_timeout": 30,
-  "realtime_buffer_max_seconds": 5
+  "realtime_buffer_max_seconds": 5,
+  "realtime_delay": "low",
+  "realtime_keywords": []
 }
 ```
 
-`whisper_prompt` does **not** apply under `realtime-ws` —
-`gpt-realtime-whisper` does not support prompt/vocabulary steering in GA
-Realtime sessions (per OpenAI's Realtime transcription guide). Domain
-vocabulary correction happens downstream in `cleanup.py` via `vocab.md`.
+`gpt-live-transcribe` accepts vocabulary steering, which its predecessor
+`gpt-realtime-whisper` did not. Under `realtime-ws` the daemon sends:
+
+- `prompt` — `whisper_prompt` from `config.json`, describing the speaker and setting
+- `keywords` — the backticked terms under **Proper nouns and spellings** in
+  `vocab.md` (up to 100). Set `"realtime_keywords"` in `config.json` to
+  override the file. This is where most of the accuracy win is: on a test
+  clip naming macwhspr, hyprwhspr, Hyprland, omarchy and Karabiner, the
+  unsteered model returned *Maclspyr, HyperLisp, Hyperland, Amarky,
+  carabiner*, and with steering all five came back exactly right.
+- `languages` — from `language`, when set
+- `delay` — `realtime_delay`, one of `minimal`, `low` (default), `medium`,
+  `high`, `xhigh`. Higher settings give the model more audio context before
+  emitting text; `low` was the best speed/accuracy trade in testing.
+
+`cleanup.py` still applies `vocab.md` in full (style and prosody rules as
+well as spellings) as a second pass.
 
 ### Batch REST fallback
 
@@ -274,7 +289,7 @@ WAV after you stop:
 {
   "transcription_backend": "rest-api",
   "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
-  "transcription_model": "gpt-4o-transcribe",
+  "transcription_model": "gpt-transcribe",
   "whisper_prompt": "Transcribe accurately. ..."
 }
 ```
@@ -283,13 +298,16 @@ Under `rest-api`, `whisper_prompt` is sent as the batch `prompt` field and
 does bias vocabulary. Measured on the same audio, the realtime path returns
 the transcript ~1s after stop regardless of dictation length, while the
 batch roundtrip grows with audio length (see `PERFORMANCE.md` for numbers);
-realtime costs more per minute ($0.017/min vs $0.006/min as of July 2026).
+realtime costs more per minute ($0.017/min vs $0.0045/min as of September
+2026).
 
-Cleanup defaults to `gpt-4.1-mini` via the OpenAI Chat Completions API. The
-model and endpoint are set as environment variables in the launchd plist:
+Cleanup defaults to `gpt-5.4-nano` via the OpenAI Chat Completions API, with
+`reasoning_effort: none` — this is a reformatting pass, and reasoning tokens
+would land straight in the latency you wait through. The model and endpoint
+are set as environment variables in the launchd plist:
 
 ```xml
-<key>MACWHSPR_CLEANUP_MODEL</key><string>gpt-4.1-mini</string>
+<key>MACWHSPR_CLEANUP_MODEL</key><string>gpt-5.4-nano</string>
 <key>MACWHSPR_LLM_API_URL</key><string>https://api.openai.com/v1/chat/completions</string>
 ```
 
@@ -371,6 +389,10 @@ POSTing to OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-05-31 | Stop/transcribe tap sounded like a doubled, overlapping beep (most noticeable on AirPods/Beats) | Not a macwhspr bug — macOS plays a Bluetooth mic→output mode-switch tone as the mic releases, layering on the soft `Pop`. Changed the default `stop_sound` to the crisper, shorter `Morse` so it no longer blends, and made `start_sound`/`stop_sound`/`error_sound` configurable in `config.json` |
 | 2026-05-31 | Silence guard clipped quiet real speech as "silent" (nothing pasted); long email dictations pasted as one unformatted blob | `silence_rms_threshold` of `0.01` sat inside real speech levels — quiet dictation logged 0.006–0.009 RMS and got dropped. Lowered the default to `0.0025` (true silence ≤0.0012, speech 0.006–0.02). Separately, the 4 s cleanup timeout fell back to raw text on long dictations: raised it to 12 s and `max_tokens` 512→2048 so long emails get formatted instead of blobbed |
 | 2026-07-13 | Switched to realtime streaming transcription (`gpt-realtime-whisper` over the Realtime WebSocket), mirroring the Linux setup's move the same day | New `realtime_client.py` (transcribe-only port of hyprwhspr's client; bytes-based, no numpy — the daemon records at 24 kHz natively for this backend so no resampling); `daemon.py` grew a `realtime-ws` path that streams sox's raw PCM while recording and commits on stop. Verified over SSH with `say`-generated speech clips streamed at 1× pacing: 6.5 s / 28 s / 94 s of audio all returned accurate transcripts **0.91–0.98 s after stop**, vs 1.67 s / 2.38 s / 5.87 s for the same clips through the batch REST path (and 3.6–5.9 s in production logs for real 100–150 s dictations). Silence guard now computes RMS in pure Python over the in-memory PCM (no WAV file exists on this path). `whisper_prompt` does not apply under realtime (no prompt support in GA Realtime sessions); vocab correction remains in `cleanup.py`. Batch path kept as `"transcription_backend": "rest-api"` |
+| 2026-09-11 | **Daemon bricked in `state=processing`; the Globe key stopped doing anything until `launchctl kickstart`.** Caught live during an audit: the daemon had been stuck for five minutes with every tap logging `Toggle ignored in state=processing` | A half-open TCP connection (Mac sleep or a Wi-Fi change; the log shows repeated `keepalive ping timeout` reconnects beforehand) left `realtime_client`'s sender thread blocked in `write()` **while holding websocket-client's internal per-socket send lock**. The daemon then called `ws.send(commit)` from the pipeline and blocked on that same lock forever, so `stop_and_process` never reached its `finally: state = "idle"`. Confirmed with `sample(1)`: the sender thread sat in `SSL_write → sock_write → write`, the main thread in an untimed `lock acquire` inside the signal handler. Four fixes: (1) the commit is queued for the sender thread instead of being sent from the caller, so `commit_and_get_text` only ever waits on `response_event` and is hard-bounded by `realtime_timeout`; (2) `SO_SNDTIMEO` (5 s) bounds every socket write; (3) `run_forever` now sends client keepalive pings (`ping_interval=20`, `ping_timeout=10`) so a dead peer surfaces as a close instead of a socket that swallows data silently; (4) the whole pipeline moved off the SIGUSR1 handler onto a worker thread, with a backstop that forces `state` back to `idle`, so a future hang anywhere costs one recording rather than the hotkey. Verified by closing the socket underneath a live client: the commit returns in 6.0 s instead of never |
+| 2026-09-11 | Transcription mangled every domain term — *Maclspyr, HyperLisp, Hyperland, Amarky, carabiner* for macwhspr, hyprwhspr, Hyprland, omarchy, Karabiner | `gpt-realtime-whisper` really had no vocabulary steering, but its successor `gpt-live-transcribe` does. Switched `realtime_model`, and the daemon now sends `prompt` plus `keywords` lifted from the **Proper nouns and spellings** section of `vocab.md`. All five terms come back exactly right, at the same latency (0.65–0.77 s commit→final) and the same $0.017/min. Also seeded `vocab.md`, which had been left as comments only, so the vocabulary layer was contributing nothing |
+| 2026-09-11 | Long dictations came back shortened and in someone else's voice, and sometimes hit the cleanup timeout and pasted raw | `gpt-4.1-mini` was paraphrasing rather than reformatting: on a 4,943-char transcript it returned 3,936 chars and rewrote first-person dictation ("I want you to look at…") into stiffer third-party prose, and its roundtrip measured 8.8–12.1 s against a 12 s ceiling. Cleanup now defaults to `gpt-5.4-nano` with `reasoning_effort: none`: 6.0 s on the same input, 4,594 chars out, paragraphing intact and the dictated voice preserved. `max_tokens` 2048 → 4096. `gpt-4.1-nano` was tried and rejected — fast, but it summarized the long case down to 1,922 chars |
+| 2026-09-11 | Batch fallback model out of date | `transcription_model` `gpt-4o-transcribe` → `gpt-transcribe`, which OpenAI positions as the Whisper replacement and prices at $0.0045/min |
 
 ## Relationship to the Linux setup
 

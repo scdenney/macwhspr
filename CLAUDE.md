@@ -3,10 +3,10 @@
 This folder is the macOS counterpart to
 [`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr) (Linux). It
 documents a voice-to-text setup that triggers on the Globe/Fn key and streams
-audio to OpenAI `gpt-realtime-whisper` (Realtime WebSocket) →
-`gpt-4.1-mini` cleanup. Same prompt, same vocab format, same
+audio to OpenAI `gpt-live-transcribe` (Realtime WebSocket) →
+`gpt-5.4-nano` cleanup. Same prompt, same vocab format, same
 `/hypr-calibrate` loop as the Linux setup — only the system glue differs. The
-batch path (`gpt-4o-transcribe`, REST upload after stop) remains available as
+batch path (`gpt-transcribe`, REST upload after stop) remains available as
 `"transcription_backend": "rest-api"`.
 
 ## What lives here
@@ -14,7 +14,7 @@ batch path (`gpt-4o-transcribe`, REST upload after stop) remains available as
 - `README.md` - public setup overview, hotkey wiring, known issues log
 - `PERFORMANCE.md` - running log of latency work: baselines, optimizations applied, how to re-measure
 - `setup.sh` - idempotent installer (also writes the Hammerspoon module + refreshes init.lua's managed block)
-- `config/daemon.py` - SIGUSR1-toggled recording/transcription daemon; drives the overlay via `hs -c`. Imports `cleanup` and `realtime_client` inline and reuses a persistent HTTP/2 `httpx.Client` across cleanup calls
+- `config/daemon.py` - SIGUSR1-toggled recording/transcription daemon; drives the overlay via `hs -c`. Imports `cleanup` and `realtime_client` inline and reuses a persistent HTTP/2 `httpx.Client` across cleanup calls. The signal handler only enqueues the toggle; the pipeline runs on a worker thread (see the hang entry in README's known issues)
 - `config/realtime_client.py` - OpenAI Realtime WebSocket transcription client (transcribe-only port of hyprwhspr's client; bytes-based PCM16, no numpy). Persistent connection opened at daemon start; auto-reconnects with backoff on unexpected close
 - `config/cleanup.py` - cleanup LLM module. `clean(raw, http_client=)` is importable from the daemon (for inline use) and `main()` still works standalone (for `/hypr-calibrate` testing)
 - `config/config.json` - daemon configuration example; `"overlay": true/false` toggles the floating pill
@@ -35,10 +35,11 @@ batch path (`gpt-4o-transcribe`, REST upload after stop) remains available as
 - History chooser path: Ctrl-Cmd-V → Hammerspoon `tail -n 20 cleanup_log.jsonl` → `hs.chooser` → on selection, `hs.pasteboard.setContents` + Cmd-V via `hs.eventtap.keyStroke` (50 ms delay so focus returns to the prior app first)
 - Overlay path: daemon shells out to `/opt/homebrew/bin/hs -c "macwhspr.show('state')"` (requires `require("hs.ipc")` in init.lua, which the bootstrap snippet provides)
 - Overlay states: `recording`, `transcribing`, `done`, `error`, `hide`. Rendered by `hs.canvas` in `~/.hammerspoon/macwhspr.lua`
-- Transcription backend (`"transcription_backend"` in config.json): `realtime-ws` (default) streams 24 kHz raw PCM from sox's stdout over a persistent WebSocket while recording and commits on stop — transcript lands ~0.9–1.0 s after the stop tap regardless of dictation length. `rest-api` is the original batch path (16 kHz WAV, upload after stop; roundtrip grows with audio length — measured 1.7 s at 6.5 s of audio up to ~5.9 s at 94–153 s). Numbers and harness in PERFORMANCE.md.
-- `whisper_prompt` applies ONLY under `rest-api` (sent as the batch `prompt` field). `gpt-realtime-whisper` has no prompt/vocabulary steering in GA Realtime sessions — vocab correction happens in `cleanup.py` via `vocab.md`.
-- Latency path: persistent `httpx.Client(http2=True)` for cleanup (and batch transcribe when on `rest-api`); cleanup runs inline (no subprocess). See PERFORMANCE.md for baselines and the optimization log.
-- Cleanup limits (`cleanup.py`): roundtrip timeout 12 s (`MACWHSPR_LLM_TIMEOUT`) and `max_tokens` 2048. Both were raised from 4 s / 512 because long dictations (e.g. a full email) timed out or truncated and fell back to pasting the raw, unformatted transcript (one big blob — no paragraph breaks, no register fixes). On timeout/failure `run_cleanup` still pastes the raw transcript.
+- Transcription backend (`"transcription_backend"` in config.json): `realtime-ws` (default, `gpt-live-transcribe`) streams 24 kHz raw PCM from sox's stdout over a persistent WebSocket while recording and commits on stop — transcript lands ~0.6–0.8 s after the stop tap regardless of dictation length. `rest-api` is the original batch path (`gpt-transcribe`, 16 kHz WAV, upload after stop; roundtrip grows with audio length). Numbers and harness in PERFORMANCE.md.
+- Vocabulary steering applies on BOTH paths now. Under `realtime-ws` the daemon sends `whisper_prompt` as the session `prompt` plus a `keywords` list lifted from the **Proper nouns and spellings** section of `vocab.md` (backticked bullets; `"realtime_keywords"` in config.json overrides). Under `rest-api` `whisper_prompt` goes in the batch `prompt` field. `cleanup.py` still applies all of `vocab.md` as a second pass. The old note that Realtime has no steering was true of `gpt-realtime-whisper` only.
+- Latency path: persistent `httpx.Client(http2=True)` for cleanup (and batch transcribe when on `rest-api`); cleanup runs inline (no subprocess). Cleanup, not transcription, is now the bulk of the post-stop wait. See PERFORMANCE.md for baselines and the optimization log.
+- The cleanup model comes from `MACWHSPR_CLEANUP_MODEL` in the launchd plist, which OVERRIDES the default in `cleanup.py` — change both, and `launchctl bootout`/`bootstrap` (not `kickstart`) to pick up new env vars.
+- Cleanup limits (`cleanup.py`): roundtrip timeout 12 s (`MACWHSPR_LLM_TIMEOUT`) and 4096 output tokens (`MACWHSPR_LLM_MAX_TOKENS`; sent as `max_completion_tokens` with `reasoning_effort: none` on gpt-5 models, which reject `temperature`). Both were raised from 4 s / 512 because long dictations (e.g. a full email) timed out or truncated and fell back to pasting the raw, unformatted transcript (one big blob — no paragraph breaks, no register fixes). On timeout/failure `run_cleanup` still pastes the raw transcript.
 - Skip-cleanup heuristic: short (<80 chars), well-formed transcripts bypass the cleanup API and are still logged to `cleanup_log.jsonl` with `"skipped": true`. Toggle via `"skip_short_cleanup": false` in `config.json`.
 - No-speech guard: a recording toggled on but left silent is dropped before transcription if its RMS amplitude (measured with `sox … stat`) falls below `"silence_rms_threshold"` (default `0.0025`; set `0` to disable — 0.01 was the initial value but it clipped quiet real speech, which runs ~0.006–0.02 RMS while true silence is ≤0.0012). As a backstop, any transcript that comes back empty or just echoes the `whisper_prompt` (or one of its sentences) is also discarded — `gpt-4o-transcribe` parrots the prompt on near-silent audio. Both paths log to `macwhspr.log`, paste nothing, and skip `cleanup_log.jsonl`. The measured RMS is logged every recording so the threshold can be tuned.
 - Recording uses sox (requires `brew install sox`): `realtime-ws` runs `sox -d -r 24000 … -t raw -` and the daemon streams stdout; `rest-api` runs `sox -d -r 16000 … <file>.wav`. On the realtime path the silence RMS is computed in pure Python over the in-memory PCM (no WAV to feed `sox … stat`).
@@ -294,6 +295,7 @@ location of `vocab.md` for future calibration.
 | Audio cues work, no overlay pill appears | `hs.ipc` not loaded OR overlay disabled in config | Reload Hammerspoon; verify with `hs -c "return type(macwhspr)"` (should print `table`). Check `"overlay"` in `~/.config/macwhspr/config.json`. |
 | Pill stuck on "Recording" or "Transcribing" | Daemon crashed mid-pipeline before sending `done`/`error`/`hide` | `tail ~/Library/Logs/macwhspr.log`; `launchctl kickstart -k gui/$UID/com.macwhspr.daemon`; `hs -c "macwhspr.show('hide')"` to clear the pill |
 | `sox: command not found` in log | sox not installed or PATH wrong | `brew install sox`; confirm `/opt/homebrew/bin` is in the plist's `PATH` env var |
+| Globe tap dead, log repeats `Toggle ignored in state=processing` | A pipeline stage hung and never reset the state. Fixed 2026-09-11 (bounded sends + worker thread); if it recurs, `sample $(cat ~/.config/macwhspr/daemon.pid)` before restarting — the stack says which thread is stuck | `launchctl kickstart -k gui/$UID/com.macwhspr.daemon` |
 | Transcription error: 401 | Bad/missing OpenAI key | `security find-generic-password -s macwhspr -a openai -w` should print the key. If empty/missing, re-run the `security add-generic-password` from Checkpoint B. |
 | First record hangs, no prompts | Keychain access denied silently | Open Keychain Access app → login keychain → search `macwhspr` → double-click → Access Control tab → allow `python` |
 | Daemon crash-loops on launch | Usually missing httpx or websocket-client | `~/.local/share/macwhspr/venv/bin/pip install 'httpx[http2]' 'websocket-client>=1.6.0'` and `launchctl kickstart -k …` |

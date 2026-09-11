@@ -17,8 +17,8 @@ The daemon emits a structured timing line per recording, format:
 ```
 
 - `audio` — wall time from start_recording until stop (≈ how long the user spoke + ~0.1 s sox shutdown)
-- `transcribe` — full OpenAI `gpt-4o-transcribe` POST roundtrip
-- `cleanup` — full OpenAI `gpt-4.1-mini` POST roundtrip (or the inline-skip path; near-zero when skipped)
+- `transcribe` — commit → final transcript on `realtime-ws` (`gpt-live-transcribe`), or the full POST roundtrip on `rest-api` (`gpt-transcribe`)
+- `cleanup` — full cleanup POST roundtrip (`gpt-5.4-nano`; near-zero on the inline-skip path)
 - `paste` — `pbcopy` write + `osascript` keystroke (~5–20 ms)
 - `post-stop` — total user-perceived latency from the second Globe tap to text on screen
 
@@ -29,6 +29,92 @@ tail -f ~/Library/Logs/macwhspr.log | grep --line-buffered "Timing:"
 ```
 
 Then dictate a few short, medium, and long utterances and read off the deltas.
+
+## 2026-09-11 — Audit pass: model refresh and the hang that bricked the hotkey
+
+Two months of production logs made the shape of the pipeline clear: with
+realtime transcription flat at **0.5–0.75 s**, cleanup is now the whole
+latency budget. Sampled from `Timing:` lines, 20 consecutive real dictations:
+
+| Stage | Range | Share of post-stop wait |
+| --- | --- | --- |
+| transcribe (`realtime-ws`) | 0.51–0.75 s | ~25% |
+| cleanup | 1.11–4.42 s | ~72% |
+| paste | 0.049–0.077 s | ~3% |
+
+So the optimization target moved from transcription to cleanup.
+
+### Cleanup model swap (the speed change)
+
+Benchmarked on three real transcripts pulled from `cleanup_log.jsonl`
+(120 / 600 / 4,943 chars), N=3 each, same system prompt, same persistent
+HTTP/2 client, min/median/max:
+
+| Model | short | medium | long (4,943 ch) | long output |
+| --- | --- | --- | --- | --- |
+| `gpt-4.1-mini` (was) | 1.06/1.29/1.35 | 2.00/2.42/2.50 | **8.77/8.84/12.13** | 3,936 ch |
+| `gpt-4.1-nano` | 0.58/0.60/0.63 | 1.00/1.08/1.51 | 2.55/2.58/3.88 | 1,922 ch |
+| `gpt-5.4-nano` (now) | 0.83/0.91/0.94 | 1.38/1.51/1.85 | **5.97/6.33/6.38** | 4,594 ch |
+| `gpt-5.4-mini` | 0.92/0.93/1.18 | 1.14/1.17/1.30 | 4.36/4.60/6.29 | 4,686 ch |
+| `gpt-5.6-luna` | 0.87/1.19/1.37 | 1.86/2.05/2.09 | 6.40/6.55/6.58 | 3,572 ch |
+
+Latency was not the only thing wrong with the old default. Read the outputs,
+not just the clock:
+
+- `gpt-4.1-mini` **paraphrased**. On the long case it returned 20% fewer
+  characters than it was given and rewrote the dictated first person ("I want
+  you to look at the sort of LaTeX formatting…") into stiffer third-party
+  prose ("Please review the TeX document formatting I have used…"). It also
+  ran into the 12 s ceiling (12.13 s measured), which falls back to pasting
+  the raw transcript as one unformatted blob.
+- `gpt-4.1-nano` is the fastest option and was rejected anyway: it compressed
+  the long case to 1,922 characters — that is summarizing, not reformatting.
+- `gpt-5.4-mini` is faster still on the long tail but under-paragraphs (12
+  breaks vs 19) and leaves false starts in.
+- `gpt-5.4-nano` preserves length and voice, paragraphs well, and cuts the
+  long case from 8.8–12.1 s to ~6.0 s. Chosen. `reasoning_effort` is set to
+  `none`; anything else puts thinking tokens directly into the wait.
+  `max_tokens` 2048 → 4096 (and renamed to `max_completion_tokens`, which the
+  gpt-5 line requires — as it also rejects `temperature`).
+
+Sampled, not exhaustive: N=3 per cell on one network, and the quality calls
+above are from reading a handful of outputs rather than a scored eval.
+
+### Transcription: steering, at no latency cost
+
+`gpt-realtime-whisper` → `gpt-live-transcribe`. The headline is accuracy, not
+speed — measured commit→final was unchanged, 0.72 s vs 0.71 s on the same
+clip, and both models cost $0.017/min. What changed is that the new model
+accepts `prompt`, `keywords`, `languages` and `delay` in the session config.
+On a `say`-generated clip naming the project's own vocabulary:
+
+| Session | commit→final | Domain terms |
+| --- | --- | --- |
+| `gpt-realtime-whisper`, bare | 0.72 s | Maclspyr, HyperLisp, Hyperland, Amarky, carabiner |
+| `gpt-live-transcribe`, bare | 0.71 s | Maclisper, Hypersper, Hyperland, Amarki, carabiner |
+| `gpt-live-transcribe`, prompt + 6 keywords | 0.77 s | **macwhspr, hyprwhspr, Hyprland, omarchy, Karabiner** |
+
+The win is the steering, not the model swap — but the swap is what makes
+steering possible. `delay` was swept at the same time: `minimal` returned in
+0.64 s but dropped a sentence-final period, `medium` cost 0.75 s with no
+visible gain. `low` stays the default.
+
+### The hang (not latency, but it was costing whole recordings)
+
+Found mid-audit with the daemon live-wedged: `state=processing` for five
+minutes, every Globe tap logging `Toggle ignored`. `sample(1)` on the process
+showed the sender thread in `SSL_write → sock_write → write` on a half-open
+socket and the main thread in an untimed lock acquire *inside the signal
+handler* — websocket-client takes a per-socket lock around `send_frame`, so
+the stuck sender was holding the lock the pipeline's commit needed.
+
+The pipeline used to run on the SIGUSR1 handler's own stack, which is why one
+blocked socket write took the hotkey down with it. It now runs on a worker
+thread fed by a `SimpleQueue`, the commit goes through the sender thread
+rather than the caller, `SO_SNDTIMEO` bounds every write at 5 s, and
+`run_forever` sends keepalive pings. Verified by closing the socket out from
+under a live client mid-recording: `commit_and_get_text` returns in 6.01 s
+against a 6 s timeout, where it previously never returned.
 
 ## 2026-07-13 — Realtime streaming transcription (the flat-latency change)
 
