@@ -7,19 +7,34 @@ multi-provider abstraction, no converse/voice-to-AI mode, no resampling
 (daemon.py records natively at 24kHz for this backend, matching what the
 Realtime API requires, so raw PCM16 bytes are sent as-is).
 
-Known limitation (confirmed against OpenAI's Realtime transcription guide
-and hyprwhspr's own realtime_client.py): gpt-realtime-whisper does not
-support prompt/vocabulary steering in GA Realtime sessions. whisper_prompt
-is NOT sent here, matching upstream behavior. Domain vocabulary correction
-still happens downstream in cleanup.py via vocab.md.
+Hang safety: every ws.send() is bounded. The socket carries SO_SNDTIMEO and
+run_forever runs client-side keepalive pings, and the commit is routed
+through the sender thread rather than being sent from the caller's thread.
+Without that last part a half-open TCP connection (Mac sleep, Wi-Fi change)
+wedges the caller forever inside websocket-client's internal send lock,
+which used to brick the daemon in state=processing until a kickstart.
 """
 
+import base64
 import json
+import socket
+import struct
 import threading
 import time
 from collections import deque
 from queue import Empty, Queue
-from typing import Optional
+
+# Wall-clock ceiling on a single socket write. Without it a half-open TCP
+# connection blocks write() indefinitely while holding websocket-client's
+# internal send lock, which in turn blocks every other sender.
+SEND_TIMEOUT_SECONDS = 5
+
+# Client-side keepalive. The server closes on its own ping timeout, but only
+# the client pinging detects a peer that has silently gone away.
+PING_INTERVAL_SECONDS = 20
+PING_TIMEOUT_SECONDS = 10
+
+_COMMIT_SENTINEL = object()
 
 try:
     import websocket
@@ -91,7 +106,19 @@ class RealtimeClient:
                 on_error=self._on_error,
                 on_close=self._on_close,
             )
-            ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+            # SO_SNDTIMEO bounds write(); ping_interval/ping_timeout make a
+            # peer that has silently gone away surface as a close instead of
+            # a socket that accepts data forever and never answers.
+            sndtimeo = struct.pack("ll", SEND_TIMEOUT_SECONDS, 0)
+            ws_thread = threading.Thread(
+                target=self.ws.run_forever,
+                kwargs={
+                    "ping_interval": PING_INTERVAL_SECONDS,
+                    "ping_timeout": PING_TIMEOUT_SECONDS,
+                    "sockopt": ((socket.SOL_SOCKET, socket.SO_SNDTIMEO, sndtimeo),),
+                },
+                daemon=True,
+            )
             ws_thread.start()
 
             timeout = 10.0
@@ -163,32 +190,46 @@ class RealtimeClient:
             flush=True,
         )
         time.sleep(delay)
-        if self._connect_internal():
-            self._send_session_update()
-            return True
-        return False
+        # _connect_internal already sends session.update on success.
+        return bool(self._connect_internal())
 
     def _send_session_update(self):
         if not self.connected or not self.ws:
             return
+        transcription = {"model": self.model, "delay": "low"}
         session_data = {
             "type": "transcription",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": self.sample_rate},
-                    "transcription": {"model": self.model, "delay": "low"},
-                    # gpt-realtime-whisper doesn't use server VAD; commits are manual
-                    # (matches hyprwhspr's handling for this model).
+                    "transcription": transcription,
+                    # Recording start/stop is the hotkey's job, not the server's;
+                    # commits are manual.
                     "turn_detection": None,
                 }
             },
         }
-        event = {"type": "session.update", "session": session_data}
-        try:
-            self.ws.send(json.dumps(event))
+        if self._send_json({"type": "session.update", "session": session_data}):
             print("[REALTIME] Sent session.update", flush=True)
+
+    def _send_json(self, event: dict) -> bool:
+        """Send one event, converting any socket failure into a False return.
+
+        Every send in this client goes through here so a dead connection can
+        never leave a caller blocked in websocket-client's send path.
+        """
+        ws = self.ws
+        if ws is None:
+            return False
+        try:
+            ws.send(json.dumps(event))
+            return True
         except Exception as e:
-            print(f"[REALTIME] Failed to send session.update: {e}", flush=True)
+            print(f"[REALTIME] Send failed ({event.get('type')}): {e}", flush=True)
+            with self.lock:
+                self.connected = False
+                self._queue_cond.notify_all()
+            return False
 
     # -- receiving --------------------------------------------------------
 
@@ -242,36 +283,48 @@ class RealtimeClient:
 
     def _start_sender_thread(self):
         with self.lock:
-            if self._sender_thread and self._sender_thread.is_alive():
+            if self._sender_running and self._sender_thread and self._sender_thread.is_alive():
                 return
+            # A sender left over from a dropped connection may still be alive
+            # (blocked in a socket write that is draining its SO_SNDTIMEO).
+            # It exits on its own because _sender_running went False in
+            # _on_close; it must not stop us starting the replacement, or the
+            # new connection would have nothing servicing its queue.
             self._sender_running = True
             self._sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
             self._sender_thread.start()
 
     def _sender_loop(self):
+        me = threading.current_thread()
         while True:
             with self.lock:
                 self._queue_cond.wait_for(
                     lambda: (not self._sender_running)
+                    or (self._sender_thread is not me)
                     or (self.connected and self.ws and len(self._audio_queue) > 0)
                 )
-                if not self._sender_running:
+                if not self._sender_running or self._sender_thread is not me:
                     return
-                chunk = self._audio_queue.popleft()
-                chunk_duration = len(chunk) / 2.0 / float(self.sample_rate)
-                self.audio_buffer_seconds = max(0.0, self.audio_buffer_seconds - chunk_duration)
-                ws = self.ws
+                item = self._audio_queue.popleft()
+                if item is not _COMMIT_SENTINEL:
+                    chunk_duration = len(item) / 2.0 / float(self.sample_rate)
+                    self.audio_buffer_seconds = max(
+                        0.0, self.audio_buffer_seconds - chunk_duration
+                    )
                 if not self._audio_queue:
                     self._queue_cond.notify_all()
-            try:
-                import base64
-                event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("utf-8"),
-                }
-                ws.send(json.dumps(event))
-            except Exception as e:
-                print(f"[REALTIME] Failed to send queued audio: {e}", flush=True)
+            if item is _COMMIT_SENTINEL:
+                # Sent from this thread, in order behind the audio it commits,
+                # so the caller never touches the socket itself.
+                if self._send_json({"type": "input_audio_buffer.commit"}):
+                    print("[REALTIME] Committed audio buffer", flush=True)
+                else:
+                    self.response_event.set()
+                continue
+            self._send_json({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(item).decode("utf-8"),
+            })
 
     def append_audio(self, pcm16_bytes: bytes):
         """Queue raw PCM16 mono bytes at self.sample_rate for sending."""
@@ -282,6 +335,7 @@ class RealtimeClient:
             while (
                 (self.audio_buffer_seconds + chunk_duration) > self.max_buffer_seconds
                 and self._audio_queue
+                and self._audio_queue[0] is not _COMMIT_SENTINEL
             ):
                 dropped = self._audio_queue.popleft()
                 self.audio_buffer_seconds = max(
@@ -300,7 +354,7 @@ class RealtimeClient:
         if not self.connected or not self.ws:
             return
         try:
-            self.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+            self._send_json({"type": "input_audio_buffer.clear"})
             with self.lock:
                 self._audio_queue.clear()
                 self.audio_buffer_seconds = 0.0
@@ -316,35 +370,41 @@ class RealtimeClient:
     # -- committing and reading the result -----------------------------------
 
     def commit_and_get_text(self, timeout: float = 30.0) -> str:
+        """Commit the streamed audio and return the final transcript.
+
+        Bounded by `timeout` under every failure mode. The caller is usually
+        the daemon's processing path, and a caller that cannot return leaves
+        the hotkey dead, so nothing here waits on the socket: the commit is
+        queued for the sender thread and we only wait on `response_event`.
+        """
         if not self.connected or not self.ws:
             print("[REALTIME] Not connected, cannot commit", flush=True)
             return ""
+        deadline = time.monotonic() + timeout
         try:
             with self.lock:
-                drain_timeout = min(self.max_buffer_seconds + 1.0, max(0.5, timeout * 0.5))
                 buffer_was_committed = self._buffer_committed
                 self._buffer_committed = False
                 self.response_event.clear()
-
-            with self.lock:
-                self._queue_cond.wait_for(lambda: len(self._audio_queue) == 0, timeout=drain_timeout)
-
-            time.sleep(0.05)  # grace period for any in-flight send to land before commit
-
-            if not buffer_was_committed:
-                self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                print("[REALTIME] Committed audio buffer", flush=True)
-            else:
-                print("[REALTIME] Skipping commit (already committed)", flush=True)
+                if not buffer_was_committed:
+                    self._audio_queue.append(_COMMIT_SENTINEL)
+                    self._queue_cond.notify_all()
+                else:
+                    print("[REALTIME] Skipping commit (already committed)", flush=True)
 
             print("[REALTIME] Waiting for transcription...", flush=True)
-            if not self.response_event.wait(timeout=timeout):
+            remaining = max(0.1, deadline - time.monotonic())
+            if not self.response_event.wait(timeout=remaining):
                 print(f"[REALTIME] Timeout waiting for transcript ({timeout}s)", flush=True)
 
             with self.lock:
                 result = " ".join(p for p in self._committed_segments if p).strip()
+                if not result:
+                    result = self._partial_transcript.strip()
                 self._committed_segments = []
+                self._partial_transcript = ""
                 self._transcript_generation = 0
+                self._audio_queue.clear()
                 self.audio_buffer_seconds = 0.0
 
             print(f"[REALTIME] Transcript received ({len(result)} chars)", flush=True)

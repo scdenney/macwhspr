@@ -16,11 +16,17 @@ Two transcription backends (config "transcription_backend"):
       done by the time the user stops talking. See realtime_client.py.
   "rest-api" - the original batch path: record a full WAV, then POST it to
       /v1/audio/transcriptions (gpt-4o-transcribe) after recording stops.
+
+The signal handler does no work: it counts the toggle and wakes a worker
+thread. Anything slow that runs on the handler's stack (the whole
+transcribe/cleanup/paste pipeline used to) blocks signal.pause(), so one
+wedged API call took the hotkey down with it.
 """
 
 import array
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -86,6 +92,7 @@ DEFAULT_CONFIG = {
 }
 
 state = "idle"
+_toggle_queue: "queue.SimpleQueue" = queue.SimpleQueue()
 recording_proc = None
 recording_started_at = 0.0
 config = {}
@@ -593,12 +600,38 @@ def paste(text: str) -> None:
 
 
 def handle_toggle(signum, frame) -> None:
-    if state == "idle":
-        start_recording()
-    elif state == "recording":
-        stop_and_process()
-    else:
-        log(f"Toggle ignored in state={state}")
+    """SIGUSR1 handler. Records the toggle and returns immediately.
+
+    Python runs this on the main thread, so anything slow here blocks
+    signal.pause() and every later tap with it.
+    """
+    # SimpleQueue.put is reentrant-safe, which is what makes it usable here.
+    _toggle_queue.put(time.time())
+
+
+def worker_loop() -> None:
+    """Drain toggles and drive the state machine off the signal handler."""
+    global state
+    while True:
+        _toggle_queue.get()
+        try:
+            if state == "idle":
+                start_recording()
+            elif state == "recording":
+                stop_and_process()
+            else:
+                log(f"Toggle ignored in state={state}")
+        except Exception as exc:
+            # A pipeline that dies mid-flight must not strand the state
+            # machine: state=processing makes every later tap a no-op.
+            log(f"Toggle handling failed: {exc}")
+            play_sound(config.get("error_sound", "Funk"))
+            notify_overlay("error")
+        finally:
+            if state == "processing":
+                log("Forcing state back to idle after processing")
+                state = "idle"
+                notify_overlay("hide")
 
 
 def handle_shutdown(signum, frame) -> None:
@@ -629,6 +662,7 @@ def main() -> None:
     signal.signal(signal.SIGUSR1, handle_toggle)
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    threading.Thread(target=worker_loop, daemon=True, name="worker").start()
     log(f"macwhspr daemon ready (PID {os.getpid()}). kill -USR1 {os.getpid()} to toggle.")
     while True:
         signal.pause()
