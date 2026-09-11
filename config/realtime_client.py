@@ -7,6 +7,12 @@ multi-provider abstraction, no converse/voice-to-AI mode, no resampling
 (daemon.py records natively at 24kHz for this backend, matching what the
 Realtime API requires, so raw PCM16 bytes are sent as-is).
 
+Vocabulary steering: `gpt-live-transcribe` (the successor to
+gpt-realtime-whisper) accepts `prompt`, `keywords` and `languages` in the
+transcription session config, so domain terms are steered at the ASR stage
+rather than being left entirely to cleanup.py. gpt-realtime-whisper itself
+has no steering; on that model these fields are simply omitted.
+
 Hang safety: every ws.send() is bounded. The socket carries SO_SNDTIMEO and
 run_forever runs client-side keepalive pings, and the commit is routed
 through the sender thread rather than being sent from the caller's thread.
@@ -34,6 +40,9 @@ SEND_TIMEOUT_SECONDS = 5
 PING_INTERVAL_SECONDS = 20
 PING_TIMEOUT_SECONDS = 10
 
+# Models that accept prompt/keywords/languages in the transcription session.
+STEERABLE_MODELS = ("gpt-live-transcribe", "gpt-transcribe")
+
 _COMMIT_SENTINEL = object()
 
 try:
@@ -49,13 +58,25 @@ except (ImportError, ModuleNotFoundError) as e:
 class RealtimeClient:
     """WebSocket client for OpenAI's Realtime transcription API (transcribe mode only)."""
 
-    def __init__(self, sample_rate: int = 24000, max_buffer_seconds: float = 5.0):
+    def __init__(
+        self,
+        sample_rate: int = 24000,
+        max_buffer_seconds: float = 5.0,
+        prompt: "str | None" = None,
+        keywords: "list | None" = None,
+        languages: "list | None" = None,
+        delay: str = "low",
+    ):
         self.ws = None
         self.url = None
         self.api_key = None
         self.model = None
         self.sample_rate = sample_rate
         self.max_buffer_seconds = max(1.0, max_buffer_seconds)
+        self.prompt = prompt
+        self.keywords = keywords or []
+        self.languages = languages or []
+        self.delay = delay
 
         self.lock = threading.Lock()
         self.connected = False
@@ -196,7 +217,18 @@ class RealtimeClient:
     def _send_session_update(self):
         if not self.connected or not self.ws:
             return
-        transcription = {"model": self.model, "delay": "low"}
+        transcription = {"model": self.model, "delay": self.delay}
+        steered = []
+        if self.model in STEERABLE_MODELS:
+            if self.prompt:
+                transcription["prompt"] = self.prompt
+                steered.append("prompt")
+            if self.keywords:
+                transcription["keywords"] = self.keywords
+                steered.append(f"{len(self.keywords)} keywords")
+            if self.languages:
+                transcription["languages"] = self.languages
+                steered.append("languages")
         session_data = {
             "type": "transcription",
             "audio": {
@@ -209,8 +241,13 @@ class RealtimeClient:
                 }
             },
         }
-        if self._send_json({"type": "session.update", "session": session_data}):
-            print("[REALTIME] Sent session.update", flush=True)
+        if not self._send_json({"type": "session.update", "session": session_data}):
+            return
+        detail = f" ({', '.join(steered)})" if steered else ""
+        print(
+            f"[REALTIME] Sent session.update: {self.model} delay={self.delay}{detail}",
+            flush=True,
+        )
 
     def _send_json(self, event: dict) -> bool:
         """Send one event, converting any socket failure into a False return.
