@@ -12,15 +12,21 @@ trigger) signals the PID with SIGUSR1 to toggle.
 
 Two transcription backends (config "transcription_backend"):
   "realtime-ws" (default) - streams audio to OpenAI's Realtime WebSocket API
-      (gpt-realtime-whisper) as sox captures it, so transcription is mostly
+      (gpt-live-transcribe) as sox captures it, so transcription is mostly
       done by the time the user stops talking. See realtime_client.py.
   "rest-api" - the original batch path: record a full WAV, then POST it to
-      /v1/audio/transcriptions (gpt-4o-transcribe) after recording stops.
+      /v1/audio/transcriptions (gpt-transcribe) after recording stops.
+
+The signal handler does no work: it counts the toggle and wakes a worker
+thread. Anything slow that runs on the handler's stack (the whole
+transcribe/cleanup/paste pipeline used to) blocks signal.pause(), so one
+wedged API call took the hotkey down with it.
 """
 
 import array
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -66,11 +72,13 @@ else:
 DEFAULT_CONFIG = {
     "transcription_backend": "realtime-ws",  # "realtime-ws" or "rest-api"
     "transcription_url": "https://api.openai.com/v1/audio/transcriptions",
-    "transcription_model": "gpt-4o-transcribe",
+    "transcription_model": "gpt-transcribe",
     "realtime_url": "wss://api.openai.com/v1/realtime?intent=transcription",
-    "realtime_model": "gpt-realtime-whisper",
+    "realtime_model": "gpt-live-transcribe",
     "realtime_timeout": 30,
     "realtime_buffer_max_seconds": 5,
+    "realtime_delay": "low",
+    "realtime_keywords": [],
     "whisper_prompt": "Transcribe accurately. The speaker is an assistant professor in programming research and computer science.",
     "language": None,
     "paste_after_copy": True,
@@ -85,7 +93,11 @@ DEFAULT_CONFIG = {
     "rest_timeout": 60,
 }
 
+VOCAB_FILE = CONFIG_DIR / "vocab.md"
+MAX_KEYWORDS = 100  # the session config is metadata, not a dictionary dump
+
 state = "idle"
+_toggle_queue: "queue.SimpleQueue" = queue.SimpleQueue()
 recording_proc = None
 recording_started_at = 0.0
 config = {}
@@ -213,15 +225,56 @@ def connect_realtime_client() -> None:
             "Falling back is not automatic -- set transcription_backend to rest-api."
         )
         return
+    keywords = vocab_keywords()
     _realtime_client = realtime_client_mod.RealtimeClient(
         sample_rate=REALTIME_SAMPLE_RATE,
         max_buffer_seconds=config.get("realtime_buffer_max_seconds", 5),
+        prompt=config.get("whisper_prompt") or None,
+        keywords=keywords,
+        languages=[config["language"]] if config.get("language") else None,
+        delay=config.get("realtime_delay", "low"),
     )
+    if keywords:
+        log(f"Realtime keyword steering: {len(keywords)} terms from vocab.md")
     ok = _realtime_client.connect(
         config["realtime_url"], api_key(), config["realtime_model"]
     )
     if not ok:
         log("ERROR: failed to connect Realtime WebSocket at startup")
+
+
+def vocab_keywords() -> list:
+    """Proper nouns from vocab.md, for Realtime `keywords` steering.
+
+    Reads the bullet/backtick terms under the "Proper nouns and spellings"
+    heading so the same file that calibrates cleanup also steers the ASR
+    stage. Explicit "realtime_keywords" in config.json is used instead when
+    set, and both are ignored by models that don't accept steering.
+    """
+    configured = config.get("realtime_keywords") or []
+    if configured:
+        return [str(k) for k in configured][:MAX_KEYWORDS]
+    if not VOCAB_FILE.exists():
+        return []
+    terms: list = []
+    in_section = False
+    for line in VOCAB_FILE.read_text().splitlines():
+        if line.startswith("#"):
+            in_section = "proper noun" in line.lower()
+            continue
+        if not in_section:
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("<!--"):
+            continue
+        stripped = stripped.lstrip("-*").strip()
+        # Backticked terms if the line uses them, else the whole line.
+        ticked = re.findall(r"`([^`]+)`", stripped)
+        for term in (ticked or [stripped]):
+            term = term.strip()
+            if term and term not in terms:
+                terms.append(term)
+    return terms[:MAX_KEYWORDS]
 
 
 def should_skip_cleanup(raw: str) -> bool:
@@ -324,10 +377,9 @@ def is_prompt_echo(raw: str) -> bool:
     only, so genuine dictation -- even sentences that reuse prompt
     vocabulary -- is never affected.
 
-    Note: whisper_prompt is not sent at all under the realtime-ws backend
-    (gpt-realtime-whisper doesn't support prompt/vocabulary steering in GA
-    Realtime sessions), so this specific hallucination mode shouldn't occur
-    there, but the empty-transcript check still applies.
+    Note: gpt-live-transcribe does take whisper_prompt as the session prompt,
+    but it has not been observed echoing it back on silence the way the batch
+    model does. The empty-transcript check carries the realtime path.
     """
     n_raw = _normalize_for_match(raw)
     if not n_raw:
@@ -593,12 +645,38 @@ def paste(text: str) -> None:
 
 
 def handle_toggle(signum, frame) -> None:
-    if state == "idle":
-        start_recording()
-    elif state == "recording":
-        stop_and_process()
-    else:
-        log(f"Toggle ignored in state={state}")
+    """SIGUSR1 handler. Records the toggle and returns immediately.
+
+    Python runs this on the main thread, so anything slow here blocks
+    signal.pause() and every later tap with it.
+    """
+    # SimpleQueue.put is reentrant-safe, which is what makes it usable here.
+    _toggle_queue.put(time.time())
+
+
+def worker_loop() -> None:
+    """Drain toggles and drive the state machine off the signal handler."""
+    global state
+    while True:
+        _toggle_queue.get()
+        try:
+            if state == "idle":
+                start_recording()
+            elif state == "recording":
+                stop_and_process()
+            else:
+                log(f"Toggle ignored in state={state}")
+        except Exception as exc:
+            # A pipeline that dies mid-flight must not strand the state
+            # machine: state=processing makes every later tap a no-op.
+            log(f"Toggle handling failed: {exc}")
+            play_sound(config.get("error_sound", "Funk"))
+            notify_overlay("error")
+        finally:
+            if state == "processing":
+                log("Forcing state back to idle after processing")
+                state = "idle"
+                notify_overlay("hide")
 
 
 def handle_shutdown(signum, frame) -> None:
@@ -629,6 +707,7 @@ def main() -> None:
     signal.signal(signal.SIGUSR1, handle_toggle)
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    threading.Thread(target=worker_loop, daemon=True, name="worker").start()
     log(f"macwhspr daemon ready (PID {os.getpid()}). kill -USR1 {os.getpid()} to toggle.")
     while True:
         signal.pause()

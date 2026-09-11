@@ -31,7 +31,7 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>MACWHSPR_CLEANUP_MODEL</key>
-        <string>gpt-4.1-mini</string>
+        <string>gpt-5.4-nano</string>
         <key>MACWHSPR_LLM_API_URL</key>
         <string>https://api.openai.com/v1/chat/completions</string>
     </dict>

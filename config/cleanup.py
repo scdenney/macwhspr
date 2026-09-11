@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-macwhspr post-transcription cleanup via GPT-4.1-mini.
+macwhspr post-transcription cleanup via gpt-5.4-nano.
 Uses httpx directly (79ms import) instead of the openai SDK (440ms import).
 Reads raw transcription from stdin, prints cleaned text to stdout.
 Logs (raw, cleaned) pairs to cleanup_log.jsonl for /hypr-calibrate sessions.
@@ -18,17 +18,21 @@ import httpx
 CREDENTIALS_FILE = Path.home() / '.local/share/macwhspr/credentials'
 VOCAB_FILE = Path.home() / '.config/macwhspr/vocab.md'
 LOG_FILE = Path.home() / '.config/macwhspr/cleanup_log.jsonl'
-MODEL = os.environ.get('MACWHSPR_CLEANUP_MODEL', 'gpt-4.1-mini')
+MODEL = os.environ.get('MACWHSPR_CLEANUP_MODEL', 'gpt-5.4-nano')
 API_URL = os.environ.get(
     'MACWHSPR_LLM_API_URL',
     'https://api.openai.com/v1/chat/completions',
 )
 # Cleanup roundtrip ceiling. 4s was too tight for long dictations (e.g. a full
-# email): gpt-4.1-mini didn't finish in time and the daemon fell back to pasting
+# email): the model didn't finish in time and the daemon fell back to pasting
 # the raw, unformatted transcript (no paragraph breaks, no register fixes). 12s
 # lets long cleanups complete; short ones still return in ~1s, so this only
 # affects the slow tail. Override with MACWHSPR_LLM_TIMEOUT if needed.
 TIMEOUT_SECONDS = float(os.environ.get('MACWHSPR_LLM_TIMEOUT', '12.0'))
+
+# Output ceiling. Cleanup rewrites the transcript in full, so this has to
+# comfortably exceed the longest dictation; 512 (~380 words) truncated emails.
+MAX_OUTPUT_TOKENS = int(os.environ.get('MACWHSPR_LLM_MAX_TOKENS', '4096'))
 
 SYSTEM_PROMPT = (
     "You are a text reformatter, not an assistant. Your only function is to take raw "
@@ -108,9 +112,16 @@ def clean(raw: str, http_client: 'httpx.Client | None' = None) -> str:
             {'role': 'system', 'content': SYSTEM_PROMPT + vocab_context()},
             {'role': 'user', 'content': raw},
         ],
-        'max_tokens': 2048,  # 512 (~380 words) truncated long dictations like emails
-        'temperature': 0.1,
     }
+    if MODEL.startswith('gpt-5'):
+        # The gpt-5 line renamed max_tokens and rejects temperature. Reasoning
+        # is off: this is a reformatting pass, and thinking tokens would land
+        # straight in the latency the user waits through.
+        payload['max_completion_tokens'] = MAX_OUTPUT_TOKENS
+        payload['reasoning_effort'] = 'none'
+    else:
+        payload['max_tokens'] = MAX_OUTPUT_TOKENS
+        payload['temperature'] = 0.1
     headers = {'Content-Type': 'application/json'}
     if key:
         headers['Authorization'] = f'Bearer {key}'
