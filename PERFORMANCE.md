@@ -18,7 +18,7 @@ The daemon emits a structured timing line per recording, format:
 
 - `audio` — wall time from start_recording until stop (≈ how long the user spoke + ~0.1 s sox shutdown)
 - `transcribe` — commit → final transcript on `realtime-ws` (`gpt-live-transcribe`), or the full POST roundtrip on `rest-api` (`gpt-transcribe`)
-- `cleanup` — full cleanup POST roundtrip (`gpt-5.4-nano`; near-zero on the inline-skip path)
+- `cleanup` — full cleanup POST roundtrip (`gpt-5.4-mini`; near-zero on the inline-skip path)
 - `paste` — `pbcopy` write + `osascript` keystroke (~5–20 ms)
 - `post-stop` — total user-perceived latency from the second Globe tap to text on screen
 
@@ -29,6 +29,52 @@ tail -f ~/Library/Logs/macwhspr.log | grep --line-buffered "Timing:"
 ```
 
 Then dictate a few short, medium, and long utterances and read off the deltas.
+
+## 2026-09-13 — Cleanup model correction: nano → mini
+
+Two days of use and a better-designed benchmark reversed the 2026-09-11
+cleanup pick. `gpt-5.4-mini` is faster than `gpt-5.4-nano` at every length
+and keeps more of what was actually said. Switched.
+
+The 09-11 comparison was run on three transcripts, and the one that decided
+it was a 4,943-character outlier — the longest dictation in the whole log.
+Median dictation is 322 characters. Choosing a model on the 99th percentile
+and shipping it for the median was the mistake.
+
+Re-run on eight real transcripts sampled from `cleanup_log.jsonl`, stratified
+short (100–300 ch) / medium (300–800) / long (1,200+), N=3 each, median
+latency per bucket:
+
+| Model | short | medium | long | out/in char ratio |
+| --- | --- | --- | --- | --- |
+| `gpt-5.4-mini` (now) | **0.75 s** | **0.89 s** | **1.85 s** | 0.98 / 0.99 / 0.88 |
+| `gpt-5.4-nano` (was) | 1.17 s | 1.05 s | 2.55 s | 0.95 / 0.96 / 0.89 |
+| `gpt-4.1-mini` (before that) | 0.79 s | 1.07 s | 2.80 s | 0.97 / 0.96 / 0.85 |
+
+mini was faster in all eight cases, by 25–40%, and preserves more of the
+source at short and medium lengths. The move off `gpt-4.1-mini` still stands
+on its own: it was slowest on long input here too.
+
+nano's one apparent advantage — more paragraph breaks — turned out to be a
+symptom of restructuring rather than better formatting. Reading the outputs:
+
+- Dictated: "The swirl and R programming, that's fine. You can keep that."
+  nano returned "The 'Swirl' and R programming **links** are fine—you can
+  keep them." The word "links" is not in the transcript. It is inferable
+  from an earlier sentence, but it is an insertion.
+- A manuscript note dictated as continuous prose came back from nano as a
+  four-item bulleted list, with "What I would like to do" changed to "What I
+  would like *you* to do". mini kept it as prose in the dictated wording.
+
+The system prompt permits a list "when the content clearly calls for it", so
+nano is not disobeying. It interprets further from the source, and for
+dictation that is the wrong direction — the job is to capture what was said.
+
+Cost is not a factor at this volume: roughly four cents a day either way.
+
+Caveat, same as before: N=3 per cell, and the fidelity judgment comes from
+reading two cases closely rather than a scored metric. The latency gap is
+consistent across all eight, which is what the switch rests on.
 
 ## 2026-09-11 — Audit pass: model refresh and the hang that bricked the hotkey
 
@@ -70,7 +116,9 @@ not just the clock:
 - `gpt-4.1-nano` is the fastest option and was rejected anyway: it compressed
   the long case to 1,922 characters — that is summarizing, not reformatting.
 - `gpt-5.4-mini` is faster still on the long tail but under-paragraphs (12
-  breaks vs 19) and leaves false starts in.
+  breaks vs 19) and leaves false starts in. **Superseded 2026-09-13: this
+  was the wrong read, and it was the wrong read because the whole comparison
+  rested on one 4,943-character outlier. See the entry above.**
 - `gpt-5.4-nano` preserves length and voice, paragraphs well, and cuts the
   long case from 8.8–12.1 s to ~6.0 s. Chosen. `reasoning_effort` is set to
   `none`; anything else puts thinking tokens directly into the wait.
