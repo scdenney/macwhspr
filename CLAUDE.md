@@ -4,7 +4,7 @@ This folder is the macOS counterpart to
 [`scdenney/hyperwhspr`](https://github.com/scdenney/hyperwhspr) (Linux). It
 documents a voice-to-text setup that triggers on the Globe/Fn key and streams
 audio to OpenAI `gpt-live-transcribe` (Realtime WebSocket) →
-`gpt-5.4-nano` cleanup. Same prompt, same vocab format, same
+`gpt-5.4-mini` cleanup. Same prompt, same vocab format, same
 `/hypr-calibrate` loop as the Linux setup — only the system glue differs. The
 batch path (`gpt-transcribe`, REST upload after stop) remains available as
 `"transcription_backend": "rest-api"`.
