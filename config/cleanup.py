@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-macwhspr post-transcription cleanup via gpt-5.4-nano.
+macwhspr post-transcription cleanup via gpt-5.4-mini.
 Uses httpx directly (79ms import) instead of the openai SDK (440ms import).
 Reads raw transcription from stdin, prints cleaned text to stdout.
 Logs (raw, cleaned) pairs to cleanup_log.jsonl for /hypr-calibrate sessions.
@@ -18,7 +18,7 @@ import httpx
 CREDENTIALS_FILE = Path.home() / '.local/share/macwhspr/credentials'
 VOCAB_FILE = Path.home() / '.config/macwhspr/vocab.md'
 LOG_FILE = Path.home() / '.config/macwhspr/cleanup_log.jsonl'
-MODEL = os.environ.get('MACWHSPR_CLEANUP_MODEL', 'gpt-5.4-nano')
+MODEL = os.environ.get('MACWHSPR_CLEANUP_MODEL', 'gpt-5.4-mini')
 API_URL = os.environ.get(
     'MACWHSPR_LLM_API_URL',
     'https://api.openai.com/v1/chat/completions',
