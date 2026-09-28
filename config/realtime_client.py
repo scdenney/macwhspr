@@ -44,6 +44,7 @@ PING_TIMEOUT_SECONDS = 10
 STEERABLE_MODELS = ("gpt-live-transcribe", "gpt-transcribe")
 
 _COMMIT_SENTINEL = object()
+_CLEAR_SENTINEL = object()
 
 try:
     import websocket
@@ -100,6 +101,10 @@ class RealtimeClient:
         self._sender_thread = None
         self._sender_running = False
         self._dropped_chunks = 0
+        # Bumped on every successful open. Each connection is a new server
+        # session with an empty input buffer, so a change mid-recording means
+        # the server has not heard all of the recording.
+        self.session_id = 0
 
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
@@ -170,6 +175,7 @@ class RealtimeClient:
         with self.lock:
             self.connected = True
             self.connecting = False
+            self.session_id += 1
             if not self.receiver_running:
                 self.receiver_running = True
                 start_receiver = True
@@ -200,6 +206,8 @@ class RealtimeClient:
             self._attempt_reconnect()
 
     def _attempt_reconnect(self):
+        if not self.receiver_running:
+            return False  # close() was called; the daemon replaced this client
         if self.reconnect_attempts >= self.max_reconnect_attempts:
             print("[REALTIME] Max reconnection attempts reached", flush=True)
             return False
@@ -343,7 +351,7 @@ class RealtimeClient:
                 if not self._sender_running or self._sender_thread is not me:
                     return
                 item = self._audio_queue.popleft()
-                if item is not _COMMIT_SENTINEL:
+                if item is not _COMMIT_SENTINEL and item is not _CLEAR_SENTINEL:
                     chunk_duration = len(item) / 2.0 / float(self.sample_rate)
                     self.audio_buffer_seconds = max(
                         0.0, self.audio_buffer_seconds - chunk_duration
@@ -357,6 +365,9 @@ class RealtimeClient:
                     print("[REALTIME] Committed audio buffer", flush=True)
                 else:
                     self.response_event.set()
+                continue
+            if item is _CLEAR_SENTINEL:
+                self._send_json({"type": "input_audio_buffer.clear"})
                 continue
             self._send_json({
                 "type": "input_audio_buffer.append",
@@ -385,6 +396,31 @@ class RealtimeClient:
                 self._audio_queue.append(pcm16_bytes)
                 self.audio_buffer_seconds += chunk_duration
                 self._queue_cond.notify_all()
+
+    def dropped_audio(self) -> bool:
+        with self.lock:
+            return self._dropped_chunks > 0
+
+    def replay_audio(self, chunks: list):
+        """Replace the server's input buffer with the whole recording.
+
+        Used when live streaming missed part of it (not connected at start,
+        a reconnect mid-recording, or queue overflow). Queued behind a clear
+        on the sender thread, so ordering is preserved and the size cap in
+        append_audio does not apply.
+        """
+        with self.lock:
+            self._audio_queue.clear()
+            self._audio_queue.append(_CLEAR_SENTINEL)
+            self._audio_queue.extend(chunks)
+            self.audio_buffer_seconds = 0.0
+            self._buffer_committed = False
+            self._committed_segments = []
+            self._partial_transcript = ""
+            self._transcript_generation = 0
+            self._dropped_chunks = 0
+            self._queue_cond.notify_all()
+        self.response_event.clear()
 
     def clear_audio_buffer(self):
         """Reset client-side state before starting a new recording."""

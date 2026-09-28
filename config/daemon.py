@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 import httpx
@@ -108,6 +109,12 @@ _realtime_client = None  # realtime_client_mod.RealtimeClient instance, connecte
 _realtime_reader_thread = None
 _realtime_pcm_chunks: list = []  # accumulated raw PCM16 bytes for the in-progress recording
 _realtime_pcm_lock = threading.Lock()
+# (client, session_id) streaming live when the recording started, or None if
+# the socket was down. Compared at stop to decide whether the server heard
+# the whole recording or needs it replayed.
+_realtime_rec_session = None
+_realtime_reconnect_thread = None
+_realtime_connect_lock = threading.Lock()
 
 # Whole-word filler tokens that disqualify a transcript from the skip-cleanup
 # heuristic (matches the Linux setup's filler_words list).
@@ -211,12 +218,17 @@ def using_realtime_backend() -> bool:
 
 
 def connect_realtime_client() -> None:
-    """Connect the persistent Realtime WebSocket client. Called once at startup.
+    """(Re)connect the persistent Realtime WebSocket client.
 
-    Reconnection on unexpected drops is handled inside RealtimeClient; this
-    is only the initial connect. If it fails, recordings will error out
-    until the daemon is restarted (matches hyprwhspr's behavior on Linux).
+    Called at startup, and again at record time whenever the socket is down
+    (e.g. the daemon started before the network was up, or the client's own
+    reconnect attempts ran out while the Mac was asleep).
     """
+    with _realtime_connect_lock:
+        _connect_realtime_client_locked()
+
+
+def _connect_realtime_client_locked() -> None:
     global _realtime_client
     if realtime_client_mod is None:
         log(
@@ -225,6 +237,10 @@ def connect_realtime_client() -> None:
             "Falling back is not automatic -- set transcription_backend to rest-api."
         )
         return
+    if _realtime_client is not None and _realtime_client.connected:
+        return
+    if _realtime_client is not None:
+        _realtime_client.close()
     keywords = vocab_keywords()
     _realtime_client = realtime_client_mod.RealtimeClient(
         sample_rate=REALTIME_SAMPLE_RATE,
@@ -240,7 +256,7 @@ def connect_realtime_client() -> None:
         config["realtime_url"], api_key(), config["realtime_model"]
     )
     if not ok:
-        log("ERROR: failed to connect Realtime WebSocket at startup")
+        log("ERROR: failed to connect Realtime WebSocket")
 
 
 def vocab_keywords() -> list:
@@ -427,12 +443,25 @@ def _realtime_reader_loop(proc: subprocess.Popen) -> None:
 
 def start_recording() -> None:
     global recording_proc, state, recording_started_at, _realtime_reader_thread
+    global _realtime_rec_session, _realtime_reconnect_thread
     rate = str(config.get("sample_rate", 16000))
     if using_realtime_backend():
         with _realtime_pcm_lock:
             _realtime_pcm_chunks.clear()
-        if _realtime_client is not None:
-            _realtime_client.clear_audio_buffer()
+        client = _realtime_client
+        if client is not None and client.connected:
+            client.clear_audio_buffer()
+            _realtime_rec_session = (client, client.session_id)
+        else:
+            # Typical after sleep or login: the socket is gone. Record anyway
+            # (audio is buffered locally) and reconnect in the background; the
+            # full recording is replayed to the new session on stop.
+            _realtime_rec_session = None
+            log("Realtime client not connected at record start, reconnecting in background")
+            _realtime_reconnect_thread = threading.Thread(
+                target=connect_realtime_client, daemon=True
+            )
+            _realtime_reconnect_thread.start()
         try:
             recording_proc = subprocess.Popen(
                 [
@@ -531,7 +560,7 @@ def stop_and_process() -> None:
 
     try:
         t0 = time.perf_counter()
-        raw = transcribe_realtime() if realtime else transcribe_rest()
+        raw = transcribe_realtime(chunks_snapshot) if realtime else transcribe_rest()
         t1 = time.perf_counter()
         if not raw or is_prompt_echo(raw):
             log(f"No speech detected (empty or prompt echo): {raw[:80]!r}")
@@ -558,13 +587,48 @@ def stop_and_process() -> None:
         state = "idle"
 
 
-def transcribe_realtime() -> str:
+def transcribe_realtime(chunks: list) -> str:
+    """Transcribe over the WebSocket, falling back to REST on the saved PCM.
+
+    The recording is always kept in memory, so a dead or replaced socket
+    never loses what was said: either it is replayed to the live session or
+    uploaded through the batch endpoint.
+    """
+    try:
+        raw = _transcribe_realtime_ws(chunks)
+    except Exception as exc:
+        log(f"Realtime transcription failed: {exc}")
+        raw = ""
+    if raw:
+        return raw
+    log("Realtime returned nothing for non-silent audio; retrying via REST")
+    write_pcm_wav(chunks, RECORDING_FILE, REALTIME_SAMPLE_RATE)
+    return transcribe_rest()
+
+
+def _transcribe_realtime_ws(chunks: list) -> str:
+    thread = _realtime_reconnect_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=15)
     if _realtime_client is None or not _realtime_client.connected:
         log("Realtime client not connected, attempting reconnect")
         connect_realtime_client()
-    if _realtime_client is None or not _realtime_client.connected:
+    client = _realtime_client
+    if client is None or not client.connected:
         raise RuntimeError("Realtime WebSocket unavailable")
-    return _realtime_client.commit_and_get_text(timeout=config.get("realtime_timeout", 30))
+    if _realtime_rec_session != (client, client.session_id) or client.dropped_audio():
+        seconds = sum(len(c) for c in chunks) / 2.0 / REALTIME_SAMPLE_RATE
+        log(f"Live stream incomplete; replaying {seconds:.1f}s of recorded audio")
+        client.replay_audio(chunks)
+    return client.commit_and_get_text(timeout=config.get("realtime_timeout", 30))
+
+
+def write_pcm_wav(chunks: list, path: Path, rate: int) -> None:
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"".join(chunks))
 
 
 def transcribe_rest() -> str:
