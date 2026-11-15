@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "overlay": True,
     "skip_short_cleanup": True,
     "silence_rms_threshold": 0.0025,
+    "dead_mic_rms_threshold": 0.0003,
     "sample_rate": 16000,
     "rest_timeout": 60,
 }
@@ -107,7 +108,8 @@ _http_client: "httpx.Client | None" = None
 # Realtime backend state
 _realtime_client = None  # realtime_client_mod.RealtimeClient instance, connected once at startup
 _realtime_reader_thread = None
-_realtime_pcm_chunks: list = []  # accumulated raw PCM16 bytes for the in-progress recording
+_realtime_audio_file = None  # temporary PCM file; bounds RAM use on long recordings
+_realtime_audio_bytes = 0
 _realtime_pcm_lock = threading.Lock()
 # (client, session_id) streaming live when the recording started, or None if
 # the socket was down. Compared at stop to decide whether the server heard
@@ -267,9 +269,12 @@ def vocab_keywords() -> list:
     stage. Explicit "realtime_keywords" in config.json is used instead when
     set, and both are ignored by models that don't accept steering.
     """
+    def valid(term: str) -> bool:
+        return bool(term.strip()) and not any(c in term for c in "<>\r\n")
+
     configured = config.get("realtime_keywords") or []
     if configured:
-        return [str(k) for k in configured][:MAX_KEYWORDS]
+        return [str(k).strip() for k in configured if valid(str(k))][:MAX_KEYWORDS]
     if not VOCAB_FILE.exists():
         return []
     terms: list = []
@@ -288,7 +293,7 @@ def vocab_keywords() -> list:
         ticked = re.findall(r"`([^`]+)`", stripped)
         for term in (ticked or [stripped]):
             term = term.strip()
-            if term and term not in terms:
+            if valid(term) and term not in terms:
                 terms.append(term)
     return terms[:MAX_KEYWORDS]
 
@@ -344,19 +349,23 @@ def measure_rms(path: Path) -> "float | None":
     return None
 
 
-def rms_of_pcm16(chunks: list) -> float:
-    """Pure-Python RMS amplitude (0..1) of concatenated PCM16 mono chunks.
+def pcm_chunks(audio_file):
+    audio_file.seek(0)
+    while chunk := audio_file.read(REALTIME_CHUNK_BYTES):
+        yield chunk
 
-    Used by the realtime-ws backend, which streams raw PCM in memory rather
-    than writing a WAV file, so there's no on-disk file for `sox ... stat`.
-    """
-    samples = array.array("h")
-    for chunk in chunks:
+
+def rms_of_pcm16(audio_file) -> float:
+    """Measure PCM16 RMS in chunks without retaining the recording in RAM."""
+    sum_sq = count = 0
+    for chunk in pcm_chunks(audio_file):
+        samples = array.array("h")
         samples.frombytes(chunk)
-    if not samples:
+        sum_sq += sum(s * s for s in samples)
+        count += len(samples)
+    if not count:
         return 0.0
-    sum_sq = sum(s * s for s in samples)
-    return (sum_sq / len(samples)) ** 0.5 / 32768.0
+    return (sum_sq / count) ** 0.5 / 32768.0
 
 
 def recording_is_silent_rms(rms: "float | None") -> bool:
@@ -375,6 +384,22 @@ def recording_is_silent_rms(rms: "float | None") -> bool:
         return False  # couldn't measure -> don't block transcription
     log(f"audio RMS {rms:.5f} (silence threshold {threshold})")
     return rms < threshold
+
+
+def skip_silent(rms: "float | None") -> None:
+    """Log and clear the overlay for a silent clip.
+
+    Near-zero RMS means the input device delivered nothing (stale default
+    device after a headset change, muted mic, missing permission), not that
+    the user stayed quiet, so show a warning instead of hiding silently.
+    """
+    log("No speech detected (silent recording), skipping")
+    dead = config.get("dead_mic_rms_threshold", 0.0003)
+    if rms is not None and dead and rms < dead:
+        log("Input looks dead; check the input device or restart the daemon")
+        notify_overlay("mic_silent")
+    else:
+        notify_overlay("hide")
 
 
 def _normalize_for_match(text: str) -> str:
@@ -431,12 +456,14 @@ def _realtime_reader_loop(proc: subprocess.Popen) -> None:
     Runs for the lifetime of one recording. Exits when sox's stdout closes
     (on terminate/kill in stop_and_process).
     """
+    global _realtime_audio_bytes
     while True:
         chunk = proc.stdout.read(REALTIME_CHUNK_BYTES)
         if not chunk:
             return
         with _realtime_pcm_lock:
-            _realtime_pcm_chunks.append(chunk)
+            _realtime_audio_file.write(chunk)
+            _realtime_audio_bytes += len(chunk)
         if _realtime_client is not None:
             _realtime_client.append_audio(chunk)
 
@@ -444,10 +471,14 @@ def _realtime_reader_loop(proc: subprocess.Popen) -> None:
 def start_recording() -> None:
     global recording_proc, state, recording_started_at, _realtime_reader_thread
     global _realtime_rec_session, _realtime_reconnect_thread
+    global _realtime_audio_file, _realtime_audio_bytes
     rate = str(config.get("sample_rate", 16000))
     if using_realtime_backend():
         with _realtime_pcm_lock:
-            _realtime_pcm_chunks.clear()
+            if _realtime_audio_file is not None:
+                _realtime_audio_file.close()
+            _realtime_audio_file = tempfile.TemporaryFile(mode="w+b")
+            _realtime_audio_bytes = 0
         client = _realtime_client
         if client is not None and client.connected:
             client.clear_audio_buffer()
@@ -530,16 +561,17 @@ def stop_and_process() -> None:
 
     if realtime:
         with _realtime_pcm_lock:
-            total_bytes = sum(len(c) for c in _realtime_pcm_chunks)
-            chunks_snapshot = list(_realtime_pcm_chunks)
+            total_bytes = _realtime_audio_bytes
         if total_bytes < 1000:
             log("Recording too short, skipping")
             notify_overlay("hide")
+            _realtime_audio_file.close()
             state = "idle"
             return
-        if recording_is_silent_rms(rms_of_pcm16(chunks_snapshot)):
-            log("No speech detected (silent recording), skipping")
-            notify_overlay("hide")
+        rms = rms_of_pcm16(_realtime_audio_file)
+        if recording_is_silent_rms(rms):
+            skip_silent(rms)
+            _realtime_audio_file.close()
             state = "idle"
             return
         audio_kb = total_bytes / 1024.0
@@ -549,9 +581,9 @@ def stop_and_process() -> None:
             notify_overlay("hide")
             state = "idle"
             return
-        if recording_is_silent_rms(measure_rms(RECORDING_FILE)):
-            log("No speech detected (silent recording), skipping")
-            notify_overlay("hide")
+        rms = measure_rms(RECORDING_FILE)
+        if recording_is_silent_rms(rms):
+            skip_silent(rms)
             state = "idle"
             return
         audio_kb = RECORDING_FILE.stat().st_size / 1024.0
@@ -560,16 +592,16 @@ def stop_and_process() -> None:
 
     try:
         t0 = time.perf_counter()
-        raw = transcribe_realtime(chunks_snapshot) if realtime else transcribe_rest()
+        raw = transcribe_realtime(_realtime_audio_file, total_bytes) if realtime else transcribe_rest()
         t1 = time.perf_counter()
         if not raw or is_prompt_echo(raw):
             log(f"No speech detected (empty or prompt echo): {raw[:80]!r}")
             notify_overlay("hide")
             return
-        log(f"Raw: {raw[:120]}")
+        log(f"Raw transcript: {len(raw)} chars")
         cleaned = run_cleanup(raw)
         t2 = time.perf_counter()
-        log(f"Cleaned: {cleaned[:120]}")
+        log(f"Cleaned transcript: {len(cleaned)} chars")
         if cleaned:
             paste(cleaned)
         t3 = time.perf_counter()
@@ -584,29 +616,32 @@ def stop_and_process() -> None:
         play_sound(config.get("error_sound", "Funk"))
         notify_overlay("error")
     finally:
+        if realtime and _realtime_audio_file is not None:
+            _realtime_audio_file.close()
         state = "idle"
 
 
-def transcribe_realtime(chunks: list) -> str:
+def transcribe_realtime(audio_file, total_bytes: int) -> str:
     """Transcribe over the WebSocket, falling back to REST on the saved PCM.
 
-    The recording is always kept in memory, so a dead or replaced socket
-    never loses what was said: either it is replayed to the live session or
-    uploaded through the batch endpoint.
+    The recording is kept in a temporary PCM file, so a dead or replaced
+    socket never loses it. Short recordings can be replayed to Realtime;
+    longer ones use chunked REST transcription.
     """
     try:
-        raw = _transcribe_realtime_ws(chunks)
+        raw = _transcribe_realtime_ws(audio_file, total_bytes)
     except Exception as exc:
         log(f"Realtime transcription failed: {exc}")
         raw = ""
     if raw:
         return raw
     log("Realtime returned nothing for non-silent audio; retrying via REST")
-    write_pcm_wav(chunks, RECORDING_FILE, REALTIME_SAMPLE_RATE)
-    return transcribe_rest()
+    with tempfile.NamedTemporaryFile(suffix=".wav") as wav_file:
+        write_pcm_wav(audio_file, Path(wav_file.name), REALTIME_SAMPLE_RATE)
+        return transcribe_rest(Path(wav_file.name))
 
 
-def _transcribe_realtime_ws(chunks: list) -> str:
+def _transcribe_realtime_ws(audio_file, total_bytes: int) -> str:
     thread = _realtime_reconnect_thread
     if thread is not None and thread.is_alive():
         thread.join(timeout=15)
@@ -617,30 +652,55 @@ def _transcribe_realtime_ws(chunks: list) -> str:
     if client is None or not client.connected:
         raise RuntimeError("Realtime WebSocket unavailable")
     if _realtime_rec_session != (client, client.session_id) or client.dropped_audio():
-        seconds = sum(len(c) for c in chunks) / 2.0 / REALTIME_SAMPLE_RATE
+        seconds = total_bytes / 2.0 / REALTIME_SAMPLE_RATE
+        if seconds > 300:
+            raise RuntimeError("Long recording needs chunked REST fallback")
         log(f"Live stream incomplete; replaying {seconds:.1f}s of recorded audio")
-        client.replay_audio(chunks)
+        client.replay_audio(pcm_chunks(audio_file))
     return client.commit_and_get_text(timeout=config.get("realtime_timeout", 30))
 
 
-def write_pcm_wav(chunks: list, path: Path, rate: int) -> None:
+def write_pcm_wav(audio_file, path: Path, rate: int) -> None:
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(rate)
-        wf.writeframes(b"".join(chunks))
+        for chunk in pcm_chunks(audio_file):
+            wf.writeframesraw(chunk)
 
 
-def transcribe_rest() -> str:
+def transcribe_rest(path: Path = RECORDING_FILE) -> str:
+    # File uploads are capped at 25 MB. Split only when needed; four minutes
+    # of 24 kHz PCM WAV is about 11.5 MB, leaving ample headroom.
+    if path.stat().st_size > 24_000_000:
+        parts = []
+        with wave.open(str(path), "rb") as source, tempfile.TemporaryDirectory() as tmp:
+            frames_per_part = source.getframerate() * 240
+            for index in range(0, source.getnframes(), frames_per_part):
+                part = Path(tmp) / f"part-{index // frames_per_part}.wav"
+                with wave.open(str(part), "wb") as target:
+                    target.setparams(source.getparams())
+                    target.writeframes(source.readframes(frames_per_part))
+                parts.append(_transcribe_rest_one(part))
+        return " ".join(parts).strip()
+    return _transcribe_rest_one(path)
+
+
+def _transcribe_rest_one(path: Path) -> str:
     key = api_key()
     client = get_http_client()
-    with open(RECORDING_FILE, "rb") as fh:
+    with open(path, "rb") as fh:
         files = {"file": ("audio.wav", fh, "audio/wav")}
         data = {"model": config["transcription_model"]}
         if config.get("whisper_prompt"):
             data["prompt"] = config["whisper_prompt"]
+        if config["transcription_model"] == "gpt-transcribe":
+            keywords = vocab_keywords()
+            if keywords:
+                data["keywords[]"] = keywords
         if config.get("language"):
-            data["language"] = config["language"]
+            field = "languages[]" if config["transcription_model"] == "gpt-transcribe" else "language"
+            data[field] = config["language"]
         resp = client.post(
             config["transcription_url"],
             files=files,

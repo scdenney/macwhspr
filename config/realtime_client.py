@@ -92,6 +92,9 @@ class RealtimeClient:
         self._partial_transcript = ""
         self._transcript_generation = 0
         self._buffer_committed = False
+        self._awaiting_item_id = None
+        self._completed_items = {}
+        self._failed_items = set()
 
         # Audio streaming (bytes-based; no numpy/resampling needed since the
         # daemon records at self.sample_rate natively for this backend).
@@ -201,6 +204,7 @@ class RealtimeClient:
             self._audio_queue.clear()
             self.audio_buffer_seconds = 0.0
             self._queue_cond.notify_all()
+        self.response_event.set()
         print(f"[REALTIME] WebSocket closed (code: {close_status_code})", flush=True)
         if self.receiver_running and close_status_code != 1000:
             self._attempt_reconnect()
@@ -274,6 +278,7 @@ class RealtimeClient:
             with self.lock:
                 self.connected = False
                 self._queue_cond.notify_all()
+            self.response_event.set()
             return False
 
     # -- receiving --------------------------------------------------------
@@ -296,26 +301,33 @@ class RealtimeClient:
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
+            item_id = event.get("item_id")
             with self.lock:
-                if not transcript:
-                    transcript = self._partial_transcript.strip()
-                if transcript:
-                    self._committed_segments.append(transcript)
-                self._transcript_generation += 1
-                self._partial_transcript = ""
-            self.response_event.set()
+                if item_id:
+                    self._completed_items[item_id] = transcript
+                    if item_id == self._awaiting_item_id:
+                        self.response_event.set()
             print(f"[REALTIME] Transcription completed ({len(transcript)} chars)", flush=True)
 
         elif event_type == "conversation.item.input_audio_transcription.delta":
-            delta = event.get("delta") or ""
-            if delta:
-                with self.lock:
-                    self._partial_transcript += delta
+            # Final text is authoritative. Deltas may belong to an older turn.
+            pass
 
         elif event_type == "input_audio_buffer.committed":
             print("[REALTIME] Audio buffer committed", flush=True)
             with self.lock:
                 self._buffer_committed = True
+                self._awaiting_item_id = event.get("item_id")
+                if self._awaiting_item_id in self._completed_items or self._awaiting_item_id in self._failed_items:
+                    self.response_event.set()
+
+        elif event_type == "conversation.item.input_audio_transcription.failed":
+            item_id = event.get("item_id")
+            with self.lock:
+                if item_id:
+                    self._failed_items.add(item_id)
+                    if item_id == self._awaiting_item_id:
+                        self.response_event.set()
 
         elif event_type == "error":
             error_message = (event.get("error") or {}).get("message", "Unknown error")
@@ -415,6 +427,9 @@ class RealtimeClient:
             self._audio_queue.extend(chunks)
             self.audio_buffer_seconds = 0.0
             self._buffer_committed = False
+            self._awaiting_item_id = None
+            self._completed_items.clear()
+            self._failed_items.clear()
             self._committed_segments = []
             self._partial_transcript = ""
             self._transcript_generation = 0
@@ -426,19 +441,20 @@ class RealtimeClient:
         """Reset client-side state before starting a new recording."""
         if not self.connected or not self.ws:
             return
-        try:
-            self._send_json({"type": "input_audio_buffer.clear"})
-            with self.lock:
-                self._audio_queue.clear()
-                self.audio_buffer_seconds = 0.0
-                self._buffer_committed = False
-                self._committed_segments = []
-                self._transcript_generation = 0
-                self._partial_transcript = ""
-                self._dropped_chunks = 0
+        with self.lock:
+            self._audio_queue.clear()
+            self._audio_queue.append(_CLEAR_SENTINEL)
+            self.audio_buffer_seconds = 0.0
+            self._buffer_committed = False
+            self._awaiting_item_id = None
+            self._completed_items.clear()
+            self._failed_items.clear()
+            self._committed_segments = []
+            self._transcript_generation = 0
+            self._partial_transcript = ""
+            self._dropped_chunks = 0
             self.response_event.clear()
-        except Exception as e:
-            print(f"[REALTIME] Failed to clear buffer: {e}", flush=True)
+            self._queue_cond.notify_all()
 
     # -- committing and reading the result -----------------------------------
 
@@ -458,6 +474,7 @@ class RealtimeClient:
             with self.lock:
                 buffer_was_committed = self._buffer_committed
                 self._buffer_committed = False
+                self._awaiting_item_id = None
                 self.response_event.clear()
                 if not buffer_was_committed:
                     self._audio_queue.append(_COMMIT_SENTINEL)
@@ -471,9 +488,13 @@ class RealtimeClient:
                 print(f"[REALTIME] Timeout waiting for transcript ({timeout}s)", flush=True)
 
             with self.lock:
-                result = " ".join(p for p in self._committed_segments if p).strip()
-                if not result:
-                    result = self._partial_transcript.strip()
+                item_id = self._awaiting_item_id
+                result = self._completed_items.get(item_id, "") if item_id else ""
+                if item_id in self._failed_items:
+                    result = ""
+                self._awaiting_item_id = None
+                self._completed_items.clear()
+                self._failed_items.clear()
                 self._committed_segments = []
                 self._partial_transcript = ""
                 self._transcript_generation = 0
@@ -481,6 +502,10 @@ class RealtimeClient:
                 self.audio_buffer_seconds = 0.0
 
             print(f"[REALTIME] Transcript received ({len(result)} chars)", flush=True)
+            if not result:
+                # A timed-out or failed turn can leave late events in this
+                # session. Replace it before the next recording.
+                self.close()
             return result
         except Exception as e:
             print(f"[REALTIME] Error in commit_and_get_text: {e}", flush=True)

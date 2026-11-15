@@ -295,7 +295,9 @@ WAV after you stop:
 ```
 
 Under `rest-api`, `whisper_prompt` is sent as the batch `prompt` field and
-does bias vocabulary. Measured on the same audio, the realtime path returns
+does bias vocabulary. The same proper nouns from `vocab.md` are sent as
+`keywords[]`; when `language` is set, `gpt-transcribe` receives it as
+`languages[]`. Measured on the same audio, the realtime path returns
 the transcript ~1s after stop regardless of dictation length, while the
 batch roundtrip grows with audio length (see `PERFORMANCE.md` for numbers);
 realtime costs more per minute ($0.017/min vs $0.0045/min as of September
@@ -312,6 +314,8 @@ are set as environment variables in the launchd plist:
 ```
 
 Point either at a local OpenAI-compatible endpoint to run cleanup locally.
+If cleanup returns an empty, truncated, or unusually shortened result, the
+daemon pastes the raw transcript and records the cleanup failure in its log.
 
 ## Cleanup prompt
 
@@ -341,6 +345,10 @@ Every cleanup is logged to:
 ```text
 ~/.config/macwhspr/cleanup_log.jsonl
 ```
+
+The log keeps the latest 2,000 entries by default and is pruned every 100
+new entries. Set `MACWHSPR_LOG_MAX_ENTRIES` in the launchd environment to
+change the limit, or `0` to retain everything. The file is owner-readable.
 
 In Claude Code on the Mac, run:
 
@@ -395,6 +403,7 @@ POSTing to OpenAI. Not wired up here; flagged as a known follow-up.
 | 2026-09-11 | Batch fallback model out of date | `transcription_model` `gpt-4o-transcribe` → `gpt-transcribe`, which OpenAI positions as the Whisper replacement and prices at $0.0045/min |
 | 2026-09-13 | Cleanup model picked on the wrong evidence | The 2026-09-11 choice of `gpt-5.4-nano` rested on a single 4,943-char transcript, the longest in the log; the median dictation is 322 chars. Re-benchmarked on eight real transcripts stratified by length: `gpt-5.4-mini` is faster in all eight (0.75/0.89/1.85 s vs 1.17/1.05/2.55 s for short/medium/long) and keeps more of the dictated wording. nano's extra paragraph breaks came with restructuring — prose turned into bullet lists, and one insertion of a word that was not in the transcript. Switched to `gpt-5.4-mini`; details in `PERFORMANCE.md` |
 | 2026-09-28 | **First dictation after waking from sleep or a fresh boot was lost** (overlay ran, nothing pasted; log: `buffer too small … 0.00ms of audio`) | The daemon starts (or the Mac wakes) before the network is up, so the WebSocket connect fails or the client's 5 reconnect attempts run out while asleep. `append_audio` silently discarded everything recorded while disconnected; the reconnect at stop then committed an empty buffer. Now: (1) a record start with the socket down reconnects in the background; (2) the client counts sessions (`session_id`), and if the live session at stop isn't the one streaming at start (or chunks were dropped) the daemon replays the whole in-memory recording behind an `input_audio_buffer.clear` before committing; (3) if the WebSocket still can't connect or returns nothing for non-silent audio, the PCM is written to a WAV and sent through the REST endpoint. Verified with `say`-generated speech: no client, a changed session, and an unreachable WebSocket URL all returned the full transcript |
+| 2026-10-28 | **Dictations silently dropped after the input device changed** (log: `audio RMS 0.00002`, `No speech detected`; nothing pasted, overlay just vanished) | The sox recorder kept the default input from daemon start, so after a headset/device change it captured flat zeros, indistinguishable from the user staying quiet. `launchctl kickstart` restored it. Added `dead_mic_rms_threshold` (default `0.0003`, well under room noise of ~0.002): a clip below it shows an amber **⚠ Mic silent** pill (`mic_silent` overlay state) instead of hiding, so a dead input is visible. Ordinary silent taps still hide quietly |
 
 ## Relationship to the Linux setup
 

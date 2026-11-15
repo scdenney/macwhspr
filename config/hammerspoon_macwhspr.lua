@@ -11,6 +11,7 @@
 --   "transcribing"  blue spinner glyph, "Transcribing" label
 --   "done"          green check, auto-hides after ~0.6 s
 --   "error"         red X, auto-hides after ~1.6 s
+--   "mic_silent"    amber warning, auto-hides after ~2.5 s
 --   "hide"          immediate hide
 --
 -- Install: setup.sh copies this file to ~/.hammerspoon/macwhspr.lua and
@@ -192,6 +193,13 @@ function M.show(stateName)
             setLabel("✕ Error")
             canvas:show()
             hideTimer = hs.timer.doAfter(1.6, function()
+                if canvas then canvas:hide() end
+            end)
+        elseif stateName == "mic_silent" then
+            setDot(0.98, 0.70, 0.15)
+            setLabel("⚠ Mic silent")
+            canvas:show()
+            hideTimer = hs.timer.doAfter(2.5, function()
                 if canvas then canvas:hide() end
             end)
         elseif stateName == "hide" then

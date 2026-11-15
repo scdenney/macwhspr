@@ -8,9 +8,11 @@ Logs (raw, cleaned) pairs to cleanup_log.jsonl for /hypr-calibrate sessions.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,8 @@ import httpx
 CREDENTIALS_FILE = Path.home() / '.local/share/macwhspr/credentials'
 VOCAB_FILE = Path.home() / '.config/macwhspr/vocab.md'
 LOG_FILE = Path.home() / '.config/macwhspr/cleanup_log.jsonl'
+MAX_LOG_ENTRIES = int(os.environ.get('MACWHSPR_LOG_MAX_ENTRIES', '2000'))
+_log_writes_since_prune = 100
 MODEL = os.environ.get('MACWHSPR_CLEANUP_MODEL', 'gpt-5.4-mini')
 API_URL = os.environ.get(
     'MACWHSPR_LLM_API_URL',
@@ -140,11 +144,20 @@ def clean(raw: str, http_client: 'httpx.Client | None' = None) -> str:
             timeout=TIMEOUT_SECONDS,
         )
     resp.raise_for_status()
-    return resp.json()['choices'][0]['message']['content'].strip()
+    choice = resp.json()['choices'][0]
+    cleaned = (choice['message']['content'] or '').strip()
+    if choice.get('finish_reason') != 'stop' or not cleaned:
+        raise ValueError('cleanup returned an incomplete or empty response')
+    raw_words = len(re.findall(r"\b\w+\b", raw))
+    cleaned_words = len(re.findall(r"\b\w+\b", cleaned))
+    if raw_words >= 25 and cleaned_words < raw_words * 0.5:
+        raise ValueError('cleanup shortened the transcript by more than half')
+    return cleaned
 
 
 def log_pair(raw: str, cleaned: str, skipped: bool = False):
     """Append a (raw, cleaned) pair to cleanup_log.jsonl for /hypr-calibrate."""
+    global _log_writes_since_prune
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         'ts': datetime.now(timezone.utc).isoformat(),
@@ -155,6 +168,19 @@ def log_pair(raw: str, cleaned: str, skipped: bool = False):
         entry['skipped'] = True
     with LOG_FILE.open('a') as f:
         f.write(json.dumps(entry) + '\n')
+    LOG_FILE.chmod(0o600)
+    _log_writes_since_prune += 1
+    if MAX_LOG_ENTRIES > 0 and _log_writes_since_prune >= 100:
+        _log_writes_since_prune = 0
+        with LOG_FILE.open() as f:
+            recent = deque(f, maxlen=MAX_LOG_ENTRIES + 1)
+        # Rewrite atomically only if older entries actually exist.
+        if len(recent) > MAX_LOG_ENTRIES:
+            tmp = LOG_FILE.with_suffix('.jsonl.tmp')
+            with tmp.open('w') as f:
+                f.writelines(list(recent)[-MAX_LOG_ENTRIES:])
+            tmp.chmod(0o600)
+            os.replace(tmp, LOG_FILE)
 
 
 # Back-compat alias: cleanup.log() was the original name.
