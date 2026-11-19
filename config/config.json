@@ -19,5 +19,8 @@
   "silence_rms_threshold": 0.0025,
   "dead_mic_rms_threshold": 0.0003,
   "sample_rate": 16000,
-  "rest_timeout": 60
+  "rest_timeout": 60,
+  "short_transcript_min_seconds": 15,
+  "short_transcript_min_cps": 8,
+  "keep_last_recording": false
 }

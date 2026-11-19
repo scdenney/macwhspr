@@ -91,6 +91,14 @@ DEFAULT_CONFIG = {
     "skip_short_cleanup": True,
     "silence_rms_threshold": 0.0025,
     "dead_mic_rms_threshold": 0.0003,
+    # Realtime sometimes returns a complete-looking but partial transcript.
+    # Recordings at least this long whose transcript runs below this rate
+    # (normal dictation is ~13-18 chars/s) are re-transcribed via REST.
+    "short_transcript_min_seconds": 15,
+    "short_transcript_min_cps": 8,
+    # Debug: keep the last recording as last_recording.wav (+ .json with the
+    # transcripts) in ~/.config/macwhspr/ for side-by-side comparison.
+    "keep_last_recording": False,
     "sample_rate": 16000,
     "rest_timeout": 60,
 }
@@ -633,12 +641,72 @@ def transcribe_realtime(audio_file, total_bytes: int) -> str:
     except Exception as exc:
         log(f"Realtime transcription failed: {exc}")
         raw = ""
-    if raw:
-        return raw
-    log("Realtime returned nothing for non-silent audio; retrying via REST")
+    seconds = total_bytes / 2.0 / REALTIME_SAMPLE_RATE
+    cps = len(raw) / seconds if seconds else 0.0
+    rest_raw = None
+    if not raw:
+        log("Realtime returned nothing for non-silent audio; retrying via REST")
+        rest_raw = _rest_from_pcm(audio_file)
+    elif (
+        seconds >= config.get("short_transcript_min_seconds", 15)
+        and cps < config.get("short_transcript_min_cps", 8)
+    ):
+        log(
+            f"Realtime transcript looks truncated ({len(raw)} chars for "
+            f"{seconds:.1f}s = {cps:.1f} chars/s); retrying via REST"
+        )
+        try:
+            rest_raw = _rest_from_pcm(audio_file)
+        except Exception as exc:
+            log(f"REST retry failed, keeping realtime transcript: {exc}")
+        else:
+            log(f"REST retry: {len(rest_raw)} chars (realtime had {len(raw)})")
+    if config.get("keep_last_recording", False):
+        save_last_recording(audio_file, raw, rest_raw, seconds)
+    if rest_raw and len(rest_raw) > len(raw):
+        return rest_raw
+    return raw
+
+
+def _rest_from_pcm(audio_file) -> str:
     with tempfile.NamedTemporaryFile(suffix=".wav") as wav_file:
         write_pcm_wav(audio_file, Path(wav_file.name), REALTIME_SAMPLE_RATE)
         return transcribe_rest(Path(wav_file.name))
+
+
+def save_last_recording(audio_file, realtime_raw: str, rest_raw, seconds: float) -> None:
+    """Debug aid: keep the latest recording and both transcripts on disk.
+
+    If REST wasn't already run, it runs in a background thread on the saved
+    WAV so the comparison never delays the paste.
+    """
+    wav_path = CONFIG_DIR / "last_recording.wav"
+    json_path = CONFIG_DIR / "last_recording.json"
+    record = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "seconds": round(seconds, 2),
+        "realtime": realtime_raw,
+        "rest": rest_raw,
+    }
+
+    def write_json():
+        json_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+
+    def rest_in_background():
+        try:
+            record["rest"] = transcribe_rest(wav_path)
+        except Exception as exc:
+            record["rest"] = f"<REST failed: {exc}>"
+        write_json()
+
+    try:
+        write_pcm_wav(audio_file, wav_path, REALTIME_SAMPLE_RATE)
+        write_json()
+        if rest_raw is None:
+            threading.Thread(target=rest_in_background, daemon=True).start()
+        log("Saved last_recording.wav/.json")
+    except Exception as exc:
+        log(f"Could not save last recording: {exc}")
 
 
 def _transcribe_realtime_ws(audio_file, total_bytes: int) -> str:
