@@ -290,6 +290,7 @@ location of `vocab.md` for future calibration.
 | --- | --- | --- |
 | Globe tap shows emoji picker | System Settings → Keyboard not set to "Do Nothing" | Checkpoint C |
 | Globe tap does nothing in any app | Karabiner rule not enabled, or kext blocked | Checkpoint A, Checkpoint D |
+| Globe dead after a Karabiner update; `~/.local/share/karabiner/log/core_service.log` loops `core_service_daemon_client connect_failed` | Karabiner 17+ privileged daemon helper not running | System Settings → General → Login Items & Extensions → enable Karabiner-Elements Privileged Daemons; open Karabiner-Elements.app |
 | F18 fires but daemon doesn't start recording | `~/.config/macwhspr/daemon.pid` missing or stale | `launchctl kickstart -k gui/$UID/com.macwhspr.daemon` |
 | Recording works, paste fails | Accessibility not granted to venv Python | System Settings → Privacy & Security → Accessibility |
 | Audio cues work, no overlay pill appears | `hs.ipc` not loaded OR overlay disabled in config | Reload Hammerspoon; verify with `hs -c "return type(macwhspr)"` (should print `table`). Check `"overlay"` in `~/.config/macwhspr/config.json`. |
